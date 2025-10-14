@@ -1,0 +1,447 @@
+import os
+import asyncio
+import httpx
+import logging
+import base64
+import time
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from github import Github
+from models import BuildRequest, BuildResponse, EvaluationPayload
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Website Developer API",
+    description="Automated web application builder API",
+    version="1.0.0",
+)
+
+
+class AppBuilder:
+    """
+    Main class responsible for building web applications based on requests.
+    """
+
+    def __init__(self):
+        # These should be set via environment variables in production
+        self.github_token = os.getenv("GITHUB_TOKEN")
+        self.valid_secret = os.getenv("API_SECRET", "default-secret")
+        self.github_client = Github(self.github_token) if self.github_token else None
+
+    def validate_secret(self, provided_secret: str) -> bool:
+        """Validate the provided secret against the expected secret."""
+        return provided_secret == self.valid_secret
+
+    async def process_build_request(self, request: BuildRequest):
+        """
+        Process the build request in the background.
+        This is the main orchestration method.
+        """
+        try:
+            logger.info(f"Starting build process for {request.task}")
+
+            # Step 1: Parse attachments and save them
+            attachments_data = await self.process_attachments(request.attachments)
+
+            # Step 2: Generate application code based on brief
+            app_code = await self.generate_application_code(
+                request.brief, request.checks, attachments_data
+            )
+
+            # Step 3: Create GitHub repository
+            repo_info = await self.create_github_repository(request.task, app_code)
+
+            # Step 4: Enable GitHub Pages
+            await self.enable_github_pages(repo_info["repo_name"])
+
+            # Step 5: Post results to evaluation URL
+            await self.post_evaluation_results(request, repo_info)
+
+            logger.info(f"Successfully completed build for {request.task}")
+
+        except Exception as e:
+            logger.error(f"Error in build process: {str(e)}")
+            # In a production system, you might want to retry or send error notifications
+
+    async def process_attachments(self, attachments):
+        """Process and decode data URI attachments."""
+        processed_attachments = []
+
+        for attachment in attachments:
+            try:
+                # Parse data URI (format: data:mime/type;base64,data)
+                if attachment.url.startswith("data:"):
+                    header, data = attachment.url.split(",", 1)
+                    mime_type = header.split(";")[0].replace("data:", "")
+
+                    # Decode base64 data
+                    decoded_data = base64.b64decode(data)
+
+                    processed_attachments.append(
+                        {
+                            "name": attachment.name,
+                            "mime_type": mime_type,
+                            "data": decoded_data,
+                        }
+                    )
+
+                    logger.info(f"Processed attachment: {attachment.name}")
+
+            except Exception as e:
+                logger.error(f"Error processing attachment {attachment.name}: {str(e)}")
+
+        return processed_attachments
+
+    async def generate_application_code(
+        self, brief: str, checks: list, attachments_data: list
+    ):
+        """
+        Generate application code based on the brief and requirements.
+        This is where you would integrate with LLMs for code generation.
+        For now, this is a skeleton that returns basic templates.
+        """
+        logger.info("Generating application code...")
+
+        # Skeleton implementation - replace with actual AI/LLM integration
+        app_files = {
+            "index.html": self.generate_html_template(brief),
+            "script.js": self.generate_js_template(brief),
+            "style.css": self.generate_css_template(),
+            "README.md": self.generate_readme(brief, checks),
+            "LICENSE": self.generate_mit_license(),
+        }
+
+        # Save attachment files
+        for attachment in attachments_data:
+            app_files[attachment["name"]] = attachment["data"]
+
+        return app_files
+
+    def generate_html_template(self, brief: str) -> str:
+        """Generate basic HTML template."""
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Generated Web App</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Generated Web Application</h1>
+        <p>Brief: {brief}</p>
+        <div id="app-content">
+            <!-- Application content will be generated here -->
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>"""
+
+    def generate_js_template(self, brief: str) -> str:
+        """Generate basic JavaScript template."""
+        return f"""// Generated JavaScript for: {brief}
+document.addEventListener('DOMContentLoaded', function() {{
+    console.log('Application loaded');
+    
+    // Get URL parameters
+    const urlParams = new URLSearchParams(window.location.search);
+    const url = urlParams.get('url');
+    
+    if (url) {{
+        console.log('URL parameter found:', url);
+        // Process the URL parameter
+        handleUrlParameter(url);
+    }} else {{
+        console.log('No URL parameter, using default');
+        handleDefault();
+    }}
+}});
+
+function handleUrlParameter(url) {{
+    // Skeleton function to handle URL parameter
+    console.log('Processing URL:', url);
+}}
+
+function handleDefault() {{
+    // Skeleton function for default behavior
+    console.log('Using default behavior');
+}}"""
+
+    def generate_css_template(self) -> str:
+        """Generate basic CSS template."""
+        return """/* Generated CSS */
+body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 20px;
+    background-color: #f5f5f5;
+}
+
+.container {
+    max-width: 800px;
+    margin: 0 auto;
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}
+
+h1 {
+    color: #333;
+    text-align: center;
+}
+
+#app-content {
+    margin-top: 20px;
+    padding: 20px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}"""
+
+    def generate_readme(self, brief: str, checks: list) -> str:
+        """Generate README.md file."""
+        checks_md = "\\n".join([f"- {check}" for check in checks])
+
+        return f"""# Generated Web Application
+
+## Description
+{brief}
+
+## Requirements
+{checks_md}
+
+## Setup
+1. Clone this repository
+2. Open `index.html` in a web browser
+3. For URL parameter testing, use: `index.html?url=your-image-url`
+
+## Usage
+This application was automatically generated based on the provided brief and requirements.
+
+## License
+MIT License - see LICENSE file for details
+"""
+
+    def generate_mit_license(self) -> str:
+        """Generate MIT license text."""
+        return """MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE."""
+
+    async def create_github_repository(self, task_name: str, app_files: dict):
+        """
+        Create a GitHub repository and push the generated files.
+        """
+        if not self.github_client:
+            logger.warning("GitHub token not configured, skipping repo creation")
+            return {
+                "repo_name": f"generated-{task_name}",
+                "repo_url": "https://github.com/user/repo",
+                "commit_sha": "abc123",
+            }
+
+        try:
+            # Create unique repo name
+            repo_name = f"generated-{task_name}-{int(time.time())}"
+
+            logger.info(f"Creating repository: {repo_name}")
+
+            # Create repository
+            user = self.github_client.get_user()
+            repo = user.create_repo(
+                name=repo_name,
+                description=f"Auto-generated web application for {task_name}",
+                private=False,
+                auto_init=True,
+            )
+
+            # Push files to repository
+            for filename, content in app_files.items():
+                if isinstance(content, bytes):
+                    # For binary files
+                    repo.create_file(
+                        path=filename, message=f"Add {filename}", content=content
+                    )
+                else:
+                    # For text files
+                    repo.create_file(
+                        path=filename, message=f"Add {filename}", content=content
+                    )
+
+            # Get the latest commit SHA
+            commits = repo.get_commits()
+            latest_commit_sha = commits[0].sha
+
+            logger.info(f"Repository created successfully: {repo.html_url}")
+
+            return {
+                "repo_name": repo_name,
+                "repo_url": repo.html_url,
+                "commit_sha": latest_commit_sha,
+            }
+
+        except Exception as e:
+            logger.error(f"Error creating GitHub repository: {str(e)}")
+            raise
+
+    async def enable_github_pages(self, repo_name: str):
+        """Enable GitHub Pages for the repository."""
+        if not self.github_client:
+            logger.warning("GitHub token not configured, skipping Pages setup")
+            return
+
+        try:
+            user = self.github_client.get_user()
+            repo = user.get_repo(repo_name)
+
+            # Enable GitHub Pages from main branch
+            repo.create_pages_site(source={"branch": "main"})
+
+            logger.info(f"GitHub Pages enabled for {repo_name}")
+
+        except Exception as e:
+            logger.error(f"Error enabling GitHub Pages: {str(e)}")
+            # Don't raise here as this might not be critical
+
+    async def post_evaluation_results(self, request: BuildRequest, repo_info: dict):
+        """Post results to the evaluation URL with retry logic."""
+        evaluation_payload = EvaluationPayload(
+            email=request.email,
+            task=request.task,
+            round=request.round,
+            nonce=request.nonce,
+            repo_url=repo_info["repo_url"],
+            commit_sha=repo_info["commit_sha"],
+            pages_url=f"https://{self.github_client.get_user().login}.github.io/{repo_info['repo_name']}"
+            if self.github_client
+            else "https://user.github.io/repo",
+        )
+        print(evaluation_payload.model_dump_json())
+        # Retry logic with exponential backoff
+        max_retries = 5
+        delay = 1
+
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        str(request.evaluation_url),
+                        json=evaluation_payload.dict(),
+                        headers={"Content-Type": "application/json"},
+                        timeout=30.0,
+                    )
+
+                    if response.status_code == 200:
+                        logger.info(
+                            f"Successfully posted evaluation results (attempt {attempt + 1})"
+                        )
+                        return
+                    else:
+                        logger.warning(
+                            f"Evaluation URL returned {response.status_code}, retrying..."
+                        )
+
+            except Exception as e:
+                logger.error(
+                    f"Error posting to evaluation URL (attempt {attempt + 1}): {str(e)}"
+                )
+
+            if attempt < max_retries - 1:
+                await asyncio.sleep(delay)
+                delay *= 2  # Exponential backoff
+
+        logger.error("Failed to post evaluation results after all retries")
+
+
+# Initialize the app builder
+app_builder = AppBuilder()
+
+
+@app.get("/")
+async def root():
+    return {"message": "Website Developer API is running"}
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+
+@app.post("/build", response_model=BuildResponse)
+async def build_application(request: BuildRequest, background_tasks: BackgroundTasks):
+    """
+    Main endpoint to build web applications based on the provided brief.
+
+    This endpoint:
+    1. Validates the secret
+    2. Parses the request and attachments
+    3. Generates the application code
+    4. Creates GitHub repo and enables Pages
+    5. Posts results to evaluation URL
+    """
+    try:
+        logger.info(
+            f"Received build request for task: {request.task}, round: {request.round}"
+        )
+
+        # Validate secret
+        if not app_builder.validate_secret(request.secret):
+            raise HTTPException(status_code=401, detail="Invalid secret")
+
+        # Add the build process to background tasks
+        background_tasks.add_task(app_builder.process_build_request, request)
+
+        return BuildResponse(
+            status="accepted",
+            message="Build request accepted and processing started",
+            task=request.task,
+            round=request.round,
+        )
+
+    except Exception as e:
+        logger.error(f"Error processing build request: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Load environment variables for configuration
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", 8000))
+
+    # Check for required environment variables
+    github_token = os.getenv("GITHUB_TOKEN")
+    api_secret = os.getenv("API_SECRET")
+
+    if not github_token:
+        print("Warning: GITHUB_TOKEN not set. Repository creation will be skipped.")
+
+    if not api_secret:
+        print(
+            "Warning: API_SECRET not set. Using default secret (not secure for production)."
+        )
+
+    print(f"Starting Website Developer API on {host}:{port}")
+
+    uvicorn.run("main:app", host=host, port=port, reload=True)
