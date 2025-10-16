@@ -21,7 +21,7 @@ def test_api():
 
     test_request = {
         "email": "test@example.com",
-        "secret": "default-secret",  # Using default secret
+        "secret": "your_secret_here",  # Using default secret
         "task": "test-captcha-solver-123",
         "round": 1,
         "nonce": "test-nonce-abc",

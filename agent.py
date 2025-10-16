@@ -1,6 +1,14 @@
 import logging
 from typing import List, Dict, Any
 from github.Repository import Repository
+from langchain.tools import tool
+from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +252,19 @@ class WebsiteAgent:
     def __init__(self, tools: AgentTools):
         self.tools = tools
         self.logger = logging.getLogger(__name__)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+        agent_tools = [
+            tool(self.tools.read_files),
+            tool(self.tools.update_files),
+            tool(self.tools.list_directory_contents),
+            tool(self.tools.delete_file),
+            tool(self.tools.get_repository_tree),
+        ]
+
+        self.agent = create_react_agent(
+            model=self.llm,
+            tools=agent_tools,
+        )
 
     async def generate_website(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -261,19 +282,92 @@ class WebsiteAgent:
         Returns:
             Dictionary with generation results and any errors
         """
-        # This function will be implemented by the student with actual LLM integration
-        # For now, it's a placeholder that demonstrates the expected interface
 
         self.logger.info(
             f"Starting website generation for round {context.get('round', 1)}"
         )
 
-        # TODO: Implement actual LLM agent logic here
-        # The agent should:
-        # 1. Analyze the brief and requirements
-        # 2. Use the tools to read current repository state
-        # 3. Generate/update appropriate files
-        # 4. Use tools to update the repository
+        SYSTEM_PROMPT = """
+        You have to make the changes, be specific about the tasks that is given to you and make sure that your generated code passes the test cases, 
+        also create the workflow file for your website so that it is deployed on github pages.
+        Don't ask questions, give your best attempt.
+        1. Analyze the brief and requirements
+        2. Use the tools to read current repository state
+        3. Generate/update appropriate files
+        4. Use tools to update the repository
+
+        It is important to create the workflow file once all the code is written.
+        Github Workflow Documentation for Pages:
+
+        ```
+        You can link your build and deploy jobs in a single workflow file, eliminating the need to create two separate files to get the same result. To get started on your workflow file, under jobs you can define a build and deploy job to execute your jobs.
+
+# ...
+
+jobs:
+  # Build job
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./
+          destination: ./_site
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v4
+
+  # Deployment job
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{steps.deployment.outputs.page_url}}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+# ...
+In certain cases, you might choose to combine everything into a single job, especially if there is no need for a build process. Consequently, you would solely focus on the deployment step.
+
+# ...
+
+jobs:
+  # Single deploy job no building
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{steps.deployment.outputs.page_url}}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Upload Artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          # upload entire directory
+          path: '.'
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+# ...
+```
+        """
+        inputs = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=self._prepare_context_for_llm(context)),
+        ]
+        for chunk in self.agent.stream({"messages": inputs}, stream_mode="values"):
+            chunk["messages"][-1].pretty_print()
 
         # Placeholder return - replace with actual implementation
         return {

@@ -7,6 +7,11 @@ import time
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from github import Github
 from models import BuildRequest, BuildResponse, EvaluationPayload
+from dotenv import load_dotenv
+from agent import WebsiteAgent, AgentTools
+
+# Load environment variables from .env file
+load_dotenv(override=True)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,7 +50,7 @@ class AppBuilder:
             # Step 1: Parse attachments and save them
             attachments_data = await self.process_attachments(request.attachments)
 
-            # Step 2: Generate application code based on brief
+            # Step 2: Generate initial application code based on brief
             app_code = await self.generate_application_code(
                 request.brief, request.checks, attachments_data
             )
@@ -56,7 +61,16 @@ class AppBuilder:
             # Step 4: Enable GitHub Pages
             await self.enable_github_pages(repo_info["repo_name"])
 
-            # Step 5: Post results to evaluation URL
+            # Step 5: Enhance with AI agent (this is where the actual AI generation happens)
+            if self.github_client:
+                await self.enhance_with_agent(
+                    repo_info["repo_name"],
+                    request.brief,
+                    request.checks,
+                    attachments_data,
+                )
+
+            # Step 6: Post results to evaluation URL
             await self.post_evaluation_results(request, repo_info)
 
             logger.info(f"Successfully completed build for {request.task}")
@@ -99,12 +113,15 @@ class AppBuilder:
     ):
         """
         Generate application code based on the brief and requirements.
-        This is where you would integrate with LLMs for code generation.
-        For now, this is a skeleton that returns basic templates.
+        Now uses the actual WebsiteAgent for AI-powered code generation.
         """
-        logger.info("Generating application code...")
+        logger.info("Generating application code using AI agent...")
 
-        # Skeleton implementation - replace with actual AI/LLM integration
+        # Create a temporary repository or use existing logic
+        # For now, we'll use the skeleton approach but this should be replaced
+        # with actual agent integration after repository creation
+
+        # Skeleton implementation - this will be replaced by agent after repo creation
         app_files = {
             "index.html": self.generate_html_template(brief),
             "script.js": self.generate_js_template(brief),
@@ -115,9 +132,62 @@ class AppBuilder:
 
         # Save attachment files
         for attachment in attachments_data:
-            app_files[attachment["name"]] = attachment["data"]
+            if isinstance(attachment["data"], bytes):
+                # For binary data, we'll need to handle differently
+                app_files[attachment["name"]] = attachment["data"]
+            else:
+                app_files[attachment["name"]] = attachment["data"]
 
         return app_files
+
+    async def enhance_with_agent(
+        self, repo_name: str, brief: str, checks: list, attachments_data: list
+    ):
+        """
+        Use the WebsiteAgent to enhance the repository after initial creation.
+        """
+        try:
+            if not self.github_client:
+                logger.warning(
+                    "GitHub client not available, skipping agent enhancement"
+                )
+                return {"success": False, "error": "GitHub client not available"}
+
+            logger.info(f"Enhancing repository {repo_name} with AI agent...")
+
+            # Get the repository object
+            user = self.github_client.get_user()
+            repo = self.github_client.get_repo(f"{user.login}/{repo_name}")
+
+            # Initialize agent tools and agent
+            agent_tools = AgentTools(repo)
+            agent = WebsiteAgent(agent_tools)
+
+            # Prepare context for the agent
+            context = {
+                "brief": brief,
+                "checks": checks,
+                "round": 1,  # This could be passed from the request
+                "attachments": attachments_data,
+                "task": repo_name,
+                "current_repo_state": None,  # Agent will read current state
+            }
+
+            # Generate website using the agent
+            result = await agent.generate_website(context)
+
+            if result.get("success"):
+                logger.info("AI agent successfully enhanced the repository")
+            else:
+                logger.warning(
+                    f"AI agent completed with issues: {result.get('message', 'Unknown error')}"
+                )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Error enhancing repository with agent: {str(e)}")
+            return {"success": False, "error": str(e)}
 
     def generate_html_template(self, brief: str) -> str:
         """Generate basic HTML template."""
@@ -249,9 +319,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
     async def create_github_repository(self, task_name: str, app_files: dict):
-        """
-        Create a GitHub repository and push the generated files.
-        """
         if not self.github_client:
             logger.warning("GitHub token not configured, skipping repo creation")
             return {
@@ -263,13 +330,12 @@ SOFTWARE."""
         try:
             # Create unique repo name
             repo_name = f"generated-{task_name}-{int(time.time())}"
-
             logger.info(f"Creating repository: {repo_name}")
 
             # Create repository
             user = self.github_client.get_user()
             repo = user.create_repo(
-                name=repo_name,
+                repo_name,
                 description=f"Auto-generated web application for {task_name}",
                 private=False,
                 auto_init=True,
@@ -277,16 +343,44 @@ SOFTWARE."""
 
             # Push files to repository
             for filename, content in app_files.items():
-                if isinstance(content, bytes):
-                    # For binary files
+                try:
                     repo.create_file(
-                        path=filename, message=f"Add {filename}", content=content
+                        filename, f"Add {filename}", content, branch="main"
                     )
-                else:
-                    # For text files
-                    repo.create_file(
-                        path=filename, message=f"Add {filename}", content=content
-                    )
+                except Exception:
+                    try:
+                        existing_file = repo.get_contents(filename)
+                        if isinstance(existing_file, list):
+                            existing_file = existing_file[0]
+                        repo.update_file(
+                            filename,
+                            f"Update {filename}",
+                            content,
+                            existing_file.sha,
+                            branch="main",
+                        )
+                    except Exception:
+                        logger.warning(f"Could not create or update {filename}")
+                        continue
+
+            # Enable GitHub Pages using REST API
+            import requests
+
+            token = self.github_token
+            api_url = f"https://api.github.com/repos/{user.login}/{repo_name}/pages"
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+            data = {"build_type": "workflow", "source": {"branch": "main", "path": "/"}}
+            response = requests.post(api_url, headers=headers, json=data)
+            if response.status_code == 201:
+                logger.info(f"GitHub Pages enabled for {repo_name}")
+            else:
+                logger.warning(
+                    f"Failed to enable GitHub Pages: {response.status_code} {response.text}"
+                )
 
             # Get the latest commit SHA
             commits = repo.get_commits()
@@ -302,7 +396,7 @@ SOFTWARE."""
 
         except Exception as e:
             logger.error(f"Error creating GitHub repository: {str(e)}")
-            raise
+            return None
 
     async def enable_github_pages(self, repo_name: str):
         """Enable GitHub Pages for the repository."""
@@ -314,13 +408,14 @@ SOFTWARE."""
             user = self.github_client.get_user()
             repo = user.get_repo(repo_name)
 
-            # Enable GitHub Pages from main branch
-            repo.create_pages_site(source={"branch": "main"})
-
-            logger.info(f"GitHub Pages enabled for {repo_name}")
+            # GitHub Pages will automatically enable when there's an index.html in the main branch
+            # We can also try to enable it via GitHub's REST API if needed
+            logger.info(f"Repository ready for GitHub Pages: {repo.html_url}")
+            pages_url = f"https://{user.login}.github.io/{repo_name}"
+            logger.info(f"Expected Pages URL: {pages_url}")
 
         except Exception as e:
-            logger.error(f"Error enabling GitHub Pages: {str(e)}")
+            logger.error(f"Error setting up GitHub Pages: {str(e)}")
             # Don't raise here as this might not be critical
 
     async def post_evaluation_results(self, request: BuildRequest, repo_info: dict):
