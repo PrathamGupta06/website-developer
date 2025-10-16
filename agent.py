@@ -303,6 +303,10 @@ class WebsiteAgent:
         You can link your build and deploy jobs in a single workflow file, eliminating the need to create two separate files to get the same result. To get started on your workflow file, under jobs you can define a build and deploy job to execute your jobs.
 
 # ...
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   # Build job
@@ -335,6 +339,10 @@ jobs:
         uses: actions/deploy-pages@v4
 # ...
 In certain cases, you might choose to combine everything into a single job, especially if there is no need for a build process. Consequently, you would solely focus on the deployment step.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 # ...
 
