@@ -50,52 +50,79 @@ The Website Developer API is a complete end-to-end solution for automated web ap
 
 ### Main Components
 
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   FastAPI App   │    │  Callback       │    │  Test Suite     │
-│   (main.py)     │◄──►│  Server         │◄──►│  (test_api.py)  │
-│                 │    │  (callback_     │    │                 │
-│   • API Routes  │    │   server.py)    │    │  • YAML Tests   │
-│   • Validation  │    │                 │    │  • Polling      │
-│   • Processing  │    │  • Playwright   │    │  • Progress     │
-└─────────────────┘    │  • Verification │    │    Tracking     │
-         │              │  • Evaluation   │    └─────────────────┘
-         ▼              └─────────────────┘
-┌─────────────────┐    
-│   AI Agent      │    
-│   (agent.py)    │    
-│                 │    
-│  • WebsiteAgent │    
-│  • AgentTools   │    
-│  • LLM Chain    │    
-└─────────────────┘    
-         │              
-         ▼              
-┌─────────────────────────────────────────────────────────────┐
-│                    GitHub Ecosystem                         │
-│                                                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │ Repository  │  │   GitHub    │  │    GitHub Pages     │ │
-│  │ Creation    │  │   Actions   │  │    Deployment       │ │
-│  │             │  │  Workflow   │  │                     │ │
-│  │ • Files     │  │             │  │ • Static Hosting    │ │
-│  │ • License   │  │ • Build     │  │ • URL Generation    │ │
-│  │ • README    │  │ • Deploy    │  │ • Access Control    │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    FastAPI[FastAPI App<br/>main.py<br/>• API Routes<br/>• Validation<br/>• Processing] 
+    Callback[Callback Server<br/>callback_server.py<br/>• Playwright<br/>• Verification<br/>• Evaluation]
+    TestSuite[Test Suite<br/>test_api.py<br/>• YAML Tests<br/>• Polling<br/>• Progress Tracking]
+    Agent[AI Agent<br/>agent.py<br/>• WebsiteAgent<br/>• AgentTools<br/>• LLM Chain]
+    
+    subgraph GitHub["GitHub Ecosystem"]
+        Repo[Repository Creation<br/>• Files<br/>• License<br/>• README]
+        Actions[GitHub Actions<br/>Workflow<br/>• Build<br/>• Deploy]
+        Pages[GitHub Pages<br/>Deployment<br/>• Static Hosting<br/>• URL Generation<br/>• Access Control]
+    end
+    
+    FastAPI <--> Callback
+    Callback <--> TestSuite
+    FastAPI --> Agent
+    Agent --> GitHub
+    Repo --> Actions
+    Actions --> Pages
 ```
 
 ### Data Flow Architecture
 
-```
-Request → Validation → AI Generation → GitHub Deploy → Verification → Results
-   │           │            │              │              │           │
-   ▼           ▼            ▼              ▼              ▼           ▼
-JSON      Secret       Code Files     Repo + Pages   Playwright   Callback
-Input     Check        + Assets       + Workflow     Testing      Response
+```mermaid
+flowchart LR
+    Request[JSON Request] --> Validation[Secret & Schema Validation]
+    Validation --> Generation[AI Code Generation]
+    Generation --> Deploy[GitHub Deploy & Pages]
+    Deploy --> Verification[Playwright Verification]
+    Verification --> Results[Callback Response]
+    
+    Request -.-> |Input| JSON[JSON Input]
+    Validation -.-> |Check| Secret[Secret Check]
+    Generation -.-> |Output| Files[Code Files + Assets]
+    Deploy -.-> |Creates| Repo[Repo + Pages + Workflow]
+    Verification -.-> |Tests| Browser[Playwright Testing]
+    Results -.-> |Returns| Callback[Callback Response]
 ```
 
 ## Codebase Structure
+
+```mermaid
+graph TD
+    subgraph Core["Core Application Files"]
+        Main[main.py<br/>FastAPI App]
+        Agent[agent.py<br/>AI Code Generation]
+        Models[models.py<br/>Pydantic Models]
+        DB[db.py<br/>Data Persistence]
+        Config[pyproject.toml<br/>Dependencies]
+    end
+    
+    subgraph Testing["Testing Infrastructure"]
+        TestAPI[eval/test_api.py<br/>Test Orchestrator]
+        Callback[eval/callback_server.py<br/>Evaluation Endpoint]
+        SampleTests[eval/sample_tests/<br/>YAML Configurations]
+    end
+    
+    subgraph Template["Repository Template"]
+        HTML[repository_starter/index.html]
+        JS[repository_starter/script.js]
+        CSS[repository_starter/style.css]
+        README[repository_starter/README.md]
+        LICENSE[repository_starter/LICENSE]
+    end
+    
+    Main --> Agent
+    Main --> Models
+    Main --> DB
+    Agent --> Models
+    TestAPI --> Callback
+    TestAPI --> SampleTests
+    Agent --> Template
+```
 
 ### Core Application Files
 
@@ -165,6 +192,27 @@ Input     Check        + Assets       + Workflow     Testing      Response
 
 ### Round 1: Initial Application Generation
 
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as FastAPI App
+    participant Agent as AI Agent
+    participant GitHub
+    participant Pages as GitHub Pages
+    participant Callback as Callback Server
+    
+    Client->>API: POST /build (JSON payload)
+    API->>API: Validate secret & schema
+    API->>API: Process attachments
+    API->>GitHub: Create repository
+    API->>Agent: Generate code with LLM
+    Agent->>GitHub: Commit files & workflow
+    GitHub->>Pages: Deploy via Actions
+    API->>Callback: Submit evaluation payload
+    Callback->>Pages: Verify with Playwright
+    Callback->>Client: Return results
+```
+
 1. **Request Reception** (`POST /build`)
    - JSON payload validation via Pydantic models
    - Secret authentication against environment variable
@@ -199,6 +247,20 @@ Input     Check        + Assets       + Workflow     Testing      Response
 
 ### Round 2+: Iterative Enhancement
 
+```mermaid
+flowchart TD
+    Start([Round 2+ Request]) --> Lookup[Task ID Lookup in CSV]
+    Lookup --> LoadRepo[Load Repository Context]
+    LoadRepo --> SkipSkeleton[Skip Skeleton Generation]
+    SkipSkeleton --> AnalyzeCode[Analyze Existing Code]
+    AnalyzeCode --> EnhancedAI[Enhanced AI Processing]
+    EnhancedAI --> TargetedUpdates[Targeted File Updates]
+    TargetedUpdates --> IncrementalDeploy[Incremental Deployment]
+    IncrementalDeploy --> RetriggerWorkflow[Re-trigger Workflow]
+    RetriggerWorkflow --> VersionTrack[Version Tracking]
+    VersionTrack --> End([Updated Application])
+```
+
 1. **Continuation Logic**
    - Task ID lookup in CSV database for existing repository
    - Repository context loading for current state analysis
@@ -218,6 +280,35 @@ Input     Check        + Assets       + Workflow     Testing      Response
 
 ### YAML-Driven Test Configuration
 
+```mermaid
+graph LR
+    subgraph YAML["YAML Test Files"]
+        Test1[test1.yaml<br/>Sum of Sales]
+        Test2[test2.yaml<br/>Markdown to HTML]  
+        Test3[test3.yaml<br/>GitHub User Lookup]
+    end
+    
+    subgraph Processing["Test Processing"]
+        Parser[YAML Parser]
+        Variables[Variable Substitution]
+        DataGen[Test Data Generation]
+    end
+    
+    subgraph Execution["Test Execution"]
+        MainAPI[Main API Server]
+        CallbackAPI[Callback Server]
+        Playwright[Browser Automation]
+    end
+    
+    YAML --> Parser
+    Parser --> Variables
+    Variables --> DataGen
+    DataGen --> MainAPI
+    MainAPI --> CallbackAPI
+    CallbackAPI --> Playwright
+    Playwright --> |Results| CallbackAPI
+```
+
 The testing system uses YAML files to define comprehensive test scenarios:
 
 ```yaml
@@ -236,6 +327,26 @@ round2:
 ```
 
 ### Automated Verification Pipeline
+
+```mermaid
+sequenceDiagram
+    participant TestData as Test Data Generation
+    participant Variables as Variable Substitution  
+    participant MainAPI as Main API Server
+    participant CallbackAPI as Callback Server
+    participant Playwright as Browser Automation
+    participant Results as Results Processing
+    
+    TestData->>Variables: Generate CSV, Markdown, JSON
+    Variables->>Variables: Process templates with seed values
+    Variables->>MainAPI: Submit build request
+    MainAPI->>CallbackAPI: Evaluation payload
+    CallbackAPI->>Playwright: Launch headless browser
+    Playwright->>Playwright: Execute JavaScript checks
+    Playwright->>Results: Return verification data
+    Results->>CallbackAPI: Process test results
+    CallbackAPI->>MainAPI: Return final status
+```
 
 1. **Test Data Generation**: Dynamic creation of CSV, Markdown, and JSON test data
 2. **Variable Substitution**: Template processing with seed values and attachment data
@@ -525,7 +636,3 @@ MIT License - This project is open source and available under the [MIT License](
 - **Examples**: Sample implementations and use cases
 - **Support**: Community forum and issue tracking
 - **Integrations**: Third-party service connectors and APIs
-
----
-
-*This comprehensive Website Developer API represents a complete solution for automated web application generation, combining cutting-edge AI technology with robust deployment infrastructure to create a seamless development-to-deployment pipeline.*
