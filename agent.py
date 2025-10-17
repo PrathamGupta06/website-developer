@@ -594,7 +594,7 @@ Follow these instructions exactly. Use the tools to inspect the current repo sta
             )
 
             for chunk in self.agent.stream({"messages": inputs}, stream_mode="values"):
-                chunk["messages"][-1].pretty_print()
+                logger.info(chunk["messages"][-1].pretty_repr())
 
             # Placeholder return - replace with actual implementation
             result = {

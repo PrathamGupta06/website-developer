@@ -16,7 +16,7 @@ from typing import Dict, List, Any
 import re
 
 # Load environment variables
-load_dotenv()
+load_dotenv(override=True)
 
 
 class APITester:

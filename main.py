@@ -118,18 +118,33 @@ class AppBuilder:
             else:
                 logger.info(f"Skipping evaluation for task {request.task}")
 
+            # Log complete success details to main logger
             logger.info(
                 f"Successfully completed build for {request.task}, round {request.round}"
             )
+            logger.info(f"Final repository info: {repo_info}")
+            logger.info(f"Attachments processed: {len(attachments_data)}")
+            logger.info(
+                f"Evaluation sent: {bool(self.github_client and request.evaluation_url)}"
+            )
+            if attachments_data:
+                logger.info(
+                    f"Processed attachments: {[att.get('name', 'unnamed') for att in attachments_data]}"
+                )
 
-            # Log successful completion
+            # Log successful completion to Telegram (summary)
             telegram_logger.end_session(
                 session_id,
                 request.task,
                 True,
                 {
-                    "repo_info": repo_info,
+                    "repo_url": repo_info.get("repo_url"),
+                    "pages_url": repo_info.get("pages_url"),
+                    "commit_sha": repo_info.get("commit_sha"),
                     "attachments_processed": len(attachments_data),
+                    "attachment_names": [
+                        att.get("name", "unnamed") for att in attachments_data
+                    ],
                     "evaluation_sent": bool(
                         self.github_client and request.evaluation_url
                     ),
@@ -137,15 +152,29 @@ class AppBuilder:
             )
 
         except Exception as e:
+            # Log complete error details to main logger
             logger.error(f"Error in build process: {str(e)}")
+            logger.error(f"Exception type: {type(e).__name__}")
+            logger.error(
+                f"Request details: {request.model_dump_json(exclude={'secret'})}"
+            )
+            logger.error(f"Session ID: {session_id}")
+            import traceback
 
-            # Log error with context
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+
+            # Log error summary to Telegram
             telegram_logger.log_error(
                 f"Build process failed for {request.task}",
                 context={
                     "task": request.task,
                     "round": request.round,
                     "email": request.email,
+                    "brief_preview": request.brief[:100] + "..."
+                    if len(request.brief) > 100
+                    else request.brief,
+                    "num_checks": len(request.checks),
+                    "num_attachments": len(request.attachments),
                     "error_type": type(e).__name__,
                 },
                 exception=e,
@@ -155,7 +184,11 @@ class AppBuilder:
                 session_id,
                 request.task,
                 False,
-                {"error": str(e), "error_type": type(e).__name__},
+                {
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "session_id": session_id,
+                },
             )
 
             # In a production system, you might want to retry or send error notifications
@@ -954,17 +987,23 @@ jobs:
             pages_url=pages_url,
         )
 
+        # Log complete payload to main logger
         logger.info(
             f"Posting evaluation results: {evaluation_payload.model_dump_json()}"
         )
 
+        # Log summary to Telegram
         telegram_logger.log_info(
             f"📤 Posting evaluation results for {request.task}",
             {
                 "task": request.task,
                 "round": request.round,
+                "email": request.email,
+                "repo_url": repo_info["repo_url"],
+                "commit_sha": repo_info["commit_sha"],
                 "pages_url": pages_url,
                 "evaluation_url": str(request.evaluation_url),
+                "nonce": request.nonce,
             },
         )
 
@@ -983,27 +1022,46 @@ jobs:
                     )
 
                     if response.status_code == 200:
+                        # Log complete response to main logger
                         logger.info(
                             f"Successfully posted evaluation results (attempt {attempt + 1})"
                         )
+                        logger.info(f"Response status: {response.status_code}")
+                        logger.info(f"Response headers: {dict(response.headers)}")
+                        logger.info(f"Response body: {response.text}")
+
+                        # Log summary to Telegram
                         telegram_logger.log_info(
                             f"✅ Successfully posted evaluation results for {request.task}",
                             {
                                 "task": request.task,
                                 "attempt": attempt + 1,
                                 "status_code": response.status_code,
+                                "response_body": response.text[:500] + "..."
+                                if len(response.text) > 500
+                                else response.text,
+                                "evaluation_payload": evaluation_payload.model_dump(),
                             },
                         )
                         return
                     else:
+                        # Log failed response to main logger
                         logger.warning(
                             f"Evaluation URL returned {response.status_code}, retrying..."
                         )
+                        logger.warning(f"Response body: {response.text}")
+                        logger.warning(f"Response headers: {dict(response.headers)}")
 
             except Exception as e:
+                # Log complete error to main logger
                 logger.error(
                     f"Error posting to evaluation URL (attempt {attempt + 1}): {str(e)}"
                 )
+                logger.error(f"Exception type: {type(e).__name__}")
+                logger.error(
+                    f"Evaluation payload: {evaluation_payload.model_dump_json()}"
+                )
+                logger.error(f"Target URL: {request.evaluation_url}")
 
                 if attempt < max_retries - 1:
                     telegram_logger.log_retry(
@@ -1017,7 +1075,15 @@ jobs:
                 await asyncio.sleep(delay)
                 delay *= 2  # Exponential backoff
 
+        # Log complete failure details to main logger
         logger.error("Failed to post evaluation results after all retries")
+        logger.error(
+            f"Final payload that failed: {evaluation_payload.model_dump_json()}"
+        )
+        logger.error(f"Target URL: {request.evaluation_url}")
+        logger.error(f"Max retries attempted: {max_retries}")
+
+        # Log summary to Telegram
         telegram_logger.log_error(
             f"Failed to post evaluation results for {request.task} after {max_retries} attempts",
             {
@@ -1025,6 +1091,7 @@ jobs:
                 "round": request.round,
                 "max_retries": max_retries,
                 "evaluation_url": str(request.evaluation_url),
+                "final_payload": evaluation_payload.model_dump(),
             },
         )
 
@@ -1056,21 +1123,34 @@ async def build_application(request: BuildRequest, background_tasks: BackgroundT
     5. Posts results to evaluation URL
     """
     try:
+        # Log complete request details to main logger
         logger.info(
             f"Received build request for task: {request.task}, round: {request.round}"
         )
+        logger.info(
+            f"Complete request details: {request.model_dump_json(exclude={'secret'})}"
+        )
 
-        # Log API request
+        # Prepare attachment summary for Telegram
+        attachment_names = (
+            [att.name for att in request.attachments] if request.attachments else []
+        )
+
+        # Log API request to Telegram (summary version)
         telegram_logger.log_info(
-            f"🚀 New build request received: {request.task}",
+            f"🚀 New build request: {request.task}",
             {
                 "task": request.task,
                 "round": request.round,
                 "email": request.email,
-                "has_attachments": len(request.attachments) > 0,
+                "brief": request.brief,
+                "checks": request.checks,
+                "attachment_names": attachment_names,
                 "num_attachments": len(request.attachments),
-                "brief_length": len(request.brief),
-                "num_checks": len(request.checks),
+                "evaluation_url": str(request.evaluation_url)
+                if request.evaluation_url
+                else None,
+                "nonce": request.nonce,
             },
         )
 
