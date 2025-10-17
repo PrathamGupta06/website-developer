@@ -710,4 +710,4 @@ if __name__ == "__main__":
 
     print(f"Starting Website Developer API on {host}:{port}")
 
-    uvicorn.run("main:app", host=host, port=port, reload=True)
+    uvicorn.run("main:app", host=host, port=port)

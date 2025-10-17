@@ -1,2 +1,0 @@
-task,email,repo_name,repo_url,latest_commit_sha,pages_url,latest_round,created_at,updated_at
-test-captcha-solver-123,test@example.com,generated-test-captcha-solver-123,https://github.com/PrathamGupta06/generated-test-captcha-solver-123,8fcdc57da1fc082a4ebca1b5193b9d1bf8964e2f,https://PrathamGupta06.github.io/generated-test-captcha-solver-123/,1,2025-10-17 13:53:06,2025-10-17 14:19:41
