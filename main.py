@@ -4,6 +4,10 @@ import httpx
 import logging
 import base64
 import time
+import sys
+import signal
+import traceback
+import uvicorn
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from github import Github
 from models import BuildRequest, BuildResponse, EvaluationPayload
@@ -104,13 +108,20 @@ class AppBuilder:
 
             # Step 5: Enhance with AI agent (this is where the actual AI generation happens)
             if self.github_client:
-                await self.enhance_with_agent(
+                agent_result = await self.enhance_with_agent(
                     repo_info["repo_name"],
                     request.brief,
                     request.checks,
                     attachments_data,
                     request.round,
                 )
+
+                # Update repo_info with latest commit SHA if agent made changes
+                if agent_result and agent_result.get("commit_sha"):
+                    repo_info["commit_sha"] = agent_result["commit_sha"]
+                    logger.info(
+                        f"Updated repo_info with latest commit SHA: {agent_result['commit_sha']}"
+                    )
 
             # Step 6: Wait for GitHub Actions workflow and Pages deployment
             if self.github_client and request.evaluation_url:
@@ -264,92 +275,201 @@ class AppBuilder:
     ):
         """
         Use the WebsiteAgent to enhance the repository after initial creation.
+        Now handles batch commits and build error recovery.
         """
-        try:
-            if not self.github_client:
-                logger.warning(
-                    "GitHub client not available, skipping agent enhancement"
-                )
-                telegram_logger.log_warning(
-                    f"⚠️ GitHub client not available for {repo_name}",
-                    {"repo_name": repo_name, "round": round_num},
-                )
-                return {"success": False, "error": "GitHub client not available"}
+        max_retries = 3  # Maximum number of retries for build failures
+        retry_count = 0
 
-            logger.info(f"Enhancing repository {repo_name} with AI agent...")
+        while retry_count <= max_retries:
+            try:
+                if not self.github_client:
+                    logger.warning(
+                        "GitHub client not available, skipping agent enhancement"
+                    )
+                    telegram_logger.log_warning(
+                        f"⚠️ GitHub client not available for {repo_name}",
+                        {"repo_name": repo_name, "round": round_num},
+                    )
+                    return {"success": False, "error": "GitHub client not available"}
 
-            telegram_logger.log_info(
-                f"🤖 Starting AI agent enhancement for {repo_name}",
-                {
-                    "repo_name": repo_name,
+                logger.info(
+                    f"Enhancing repository {repo_name} with AI agent (attempt {retry_count + 1}/{max_retries + 1})..."
+                )
+
+                # Get the repository object
+                user = self.github_client.get_user()
+                repo = self.github_client.get_repo(f"{user.login}/{repo_name}")
+
+                # Initialize agent tools and agent
+                agent_tools = AgentTools(repo)
+                agent = WebsiteAgent(agent_tools)
+
+                # Prepare context for the agent
+                context = {
+                    "brief": brief,
+                    "checks": checks,
                     "round": round_num,
-                    "brief_length": len(brief),
-                    "num_checks": len(checks),
-                    "num_attachments": len(attachments_data),
-                },
-            )
+                    "attachments": attachments_data,
+                    "task": repo_name,
+                    "current_repo_state": None,  # Agent will read current state
+                    "retry_attempt": retry_count,
+                }
 
-            # Get the repository object
-            user = self.github_client.get_user()
-            repo = self.github_client.get_repo(f"{user.login}/{repo_name}")
+                # Add build error context if this is a retry
+                if retry_count > 0:
+                    build_errors = agent_tools.get_build_errors()
+                    if build_errors.get("has_errors"):
+                        context["build_errors"] = build_errors
+                        logger.info(
+                            f"Adding build error context for retry: {build_errors}"
+                        )
 
-            # Initialize agent tools and agent
-            agent_tools = AgentTools(repo)
-            agent = WebsiteAgent(agent_tools)
-
-            # Prepare context for the agent
-            context = {
-                "brief": brief,
-                "checks": checks,
-                "round": round_num,  # Pass the actual round number
-                "attachments": attachments_data,
-                "task": repo_name,
-                "current_repo_state": None,  # Agent will read current state
-            }
-
-            # Generate website using the agent
-            result = await agent.generate_website(context)
-
-            if result.get("success"):
-                logger.info("AI agent successfully enhanced the repository")
                 telegram_logger.log_info(
-                    f"✅ AI agent successfully enhanced {repo_name}",
+                    f"🤖 Starting AI agent enhancement for {repo_name} (attempt {retry_count + 1})",
                     {
                         "repo_name": repo_name,
                         "round": round_num,
-                        "files_modified": result.get("files_modified", []),
-                        "files_created": result.get("files_created", []),
-                        "files_deleted": result.get("files_deleted", []),
-                    },
-                )
-            else:
-                logger.warning(
-                    f"AI agent completed with issues: {result.get('message', 'Unknown error')}"
-                )
-                telegram_logger.log_warning(
-                    f"⚠️ AI agent completed with issues for {repo_name}",
-                    {
-                        "repo_name": repo_name,
-                        "round": round_num,
-                        "error": result.get("error"),
-                        "message": result.get("message"),
+                        "retry_attempt": retry_count,
+                        "brief_length": len(brief),
+                        "num_checks": len(checks),
+                        "num_attachments": len(attachments_data),
+                        "has_build_errors": bool(context.get("build_errors")),
                     },
                 )
 
-            return result
+                # Generate website using the agent
+                result = await agent.generate_website(context)
 
-        except Exception as e:
-            logger.error(f"Error enhancing repository with agent: {str(e)}")
-            telegram_logger.log_error(
-                f"AI agent enhancement failed for {repo_name}",
-                context={
-                    "repo_name": repo_name,
-                    "round": round_num,
-                    "operation": "enhance_with_agent",
-                },
-                exception=e,
-            )
-            return {"success": False, "error": str(e)}
+                if result.get("success"):
+                    # Get the commit SHA from the result if available
+                    commit_sha = result.get("commit_sha")
+
+                    if commit_sha:
+                        logger.info(
+                            f"AI agent successfully enhanced the repository with commit: {commit_sha}"
+                        )
+
+                        # Wait for the build to complete and check for errors
+                        build_successful = await self.wait_for_workflow_completion(
+                            repo, timeout=300
+                        )
+
+                        if build_successful:
+                            # Build succeeded, we're done
+                            telegram_logger.log_info(
+                                f"✅ AI agent successfully enhanced {repo_name} and build succeeded",
+                                {
+                                    "repo_name": repo_name,
+                                    "round": round_num,
+                                    "retry_attempt": retry_count,
+                                    "commit_sha": commit_sha,
+                                    "files_created": result.get("files_created", 0),
+                                    "files_modified": result.get("files_modified", 0),
+                                    "files_deleted": result.get("files_deleted", 0),
+                                },
+                            )
+
+                            # Update result with commit SHA
+                            result["commit_sha"] = commit_sha
+                            return result
+
+                        else:
+                            # Build failed, check if we should retry
+                            if retry_count < max_retries:
+                                logger.warning(
+                                    f"Build failed, retrying (attempt {retry_count + 1}/{max_retries + 1})"
+                                )
+                                telegram_logger.log_warning(
+                                    f"⚠️ Build failed for {repo_name}, retrying",
+                                    {
+                                        "repo_name": repo_name,
+                                        "round": round_num,
+                                        "retry_attempt": retry_count,
+                                        "commit_sha": commit_sha,
+                                    },
+                                )
+                                retry_count += 1
+                                continue
+                            else:
+                                # Max retries reached
+                                logger.error(
+                                    f"Build failed after {max_retries + 1} attempts"
+                                )
+                                telegram_logger.log_error(
+                                    f"Build failed for {repo_name} after max retries",
+                                    context={
+                                        "repo_name": repo_name,
+                                        "round": round_num,
+                                        "max_retries": max_retries,
+                                        "commit_sha": commit_sha,
+                                    },
+                                )
+
+                                result["build_failed"] = True
+                                result["commit_sha"] = commit_sha
+                                return result
+                    else:
+                        # No commit made, but agent completed successfully
+                        logger.info("AI agent completed successfully with no changes")
+                        telegram_logger.log_info(
+                            f"✅ AI agent completed for {repo_name} with no changes",
+                            {
+                                "repo_name": repo_name,
+                                "round": round_num,
+                                "retry_attempt": retry_count,
+                            },
+                        )
+                        return result
+                else:
+                    logger.warning(
+                        f"AI agent completed with issues: {result.get('message', 'Unknown error')}"
+                    )
+                    telegram_logger.log_warning(
+                        f"⚠️ AI agent completed with issues for {repo_name}",
+                        {
+                            "repo_name": repo_name,
+                            "round": round_num,
+                            "retry_attempt": retry_count,
+                            "error": result.get("error"),
+                            "message": result.get("message"),
+                        },
+                    )
+                    return result
+
+            except Exception as e:
+                logger.error(
+                    f"Error enhancing repository with agent (attempt {retry_count + 1}): {str(e)}"
+                )
+
+                if retry_count < max_retries:
+                    logger.info(
+                        f"Retrying due to error (attempt {retry_count + 1}/{max_retries + 1})"
+                    )
+                    retry_count += 1
+                    continue
+                else:
+                    telegram_logger.log_error(
+                        f"AI agent enhancement failed for {repo_name} after max retries",
+                        context={
+                            "repo_name": repo_name,
+                            "round": round_num,
+                            "max_retries": max_retries,
+                            "operation": "enhance_with_agent",
+                        },
+                        exception=e,
+                    )
+                    return {
+                        "success": False,
+                        "error": str(e),
+                        "message": f"Failed after {max_retries + 1} attempts: {str(e)}",
+                    }
+
+        # Should never reach here, but just in case
+        return {
+            "success": False,
+            "error": "Unexpected error in retry loop",
+            "message": "Enhancement failed due to unexpected error",
+        }
 
     def generate_html_template(self, brief: str) -> str:
         """Generate basic HTML template."""
@@ -592,17 +712,25 @@ SOFTWARE."""
                     file_sha = None
                     try:
                         file_obj = repo.get_contents(filename)
+                        # Handle both single file and list responses
+                        if isinstance(file_obj, list) and len(file_obj) > 0:
+                            file_obj = file_obj[0]
+
                         if file_obj and hasattr(file_obj, "sha"):
                             file_exists = True
                             file_sha = file_obj.sha
-                            logger.info(f"File {filename} already exists, will update")
+                            logger.info(
+                                f"File {filename} already exists, will update (SHA: {file_sha})"
+                            )
                         else:
                             logger.info(
                                 f"File {filename} exists but no SHA found, will create"
                             )
-                    except Exception:
+                    except Exception as e:
                         file_exists = False
-                        logger.info(f"File {filename} doesn't exist, will create")
+                        logger.info(
+                            f"File {filename} doesn't exist, will create (Error: {str(e)})"
+                        )
 
                     # Prepare content based on type
                     final_content = None
@@ -620,13 +748,26 @@ SOFTWARE."""
 
                     # Create or update file
                     if file_exists and file_sha:
-                        repo.update_file(
-                            filename, f"Update {filename}", final_content, file_sha
+                        # File exists, update it
+                        logger.info(
+                            f"Updating existing file: {filename} with SHA: {file_sha}"
                         )
-                        logger.info(f"Updated file: {filename}")
+                        repo.update_file(
+                            path=filename,
+                            message=f"Update {filename}",
+                            content=final_content,
+                            sha=file_sha,
+                        )
+                        logger.info(f"Successfully updated file: {filename}")
                     else:
-                        repo.create_file(filename, f"Add {filename}", final_content)
-                        logger.info(f"Created file: {filename}")
+                        # File doesn't exist, create it
+                        logger.info(f"Creating new file: {filename}")
+                        repo.create_file(
+                            path=filename,
+                            message=f"Add {filename}",
+                            content=final_content,
+                        )
+                        logger.info(f"Successfully created file: {filename}")
 
                 except Exception as file_error:
                     logger.error(f"Error handling {filename}: {str(file_error)}")
@@ -636,25 +777,65 @@ SOFTWARE."""
             if is_first_round:
                 workflow_content = self.get_github_pages_workflow()
                 workflow_path = ".github/workflows/pages.yml"
+
+                # Check if workflow file already exists
+                workflow_exists = False
+                workflow_sha = None
                 try:
-                    repo.create_file(
-                        workflow_path, "Add GitHub Pages workflow", workflow_content
-                    )
-                    logger.info(f"Added workflow file: {workflow_path}")
-                except Exception as workflow_error:
-                    if "already exists" in str(workflow_error):
-                        # Update existing workflow
-                        file_obj = repo.get_contents(workflow_path)
-                        repo.update_file(
-                            workflow_path,
-                            "Update GitHub Pages workflow",
-                            workflow_content,
-                            file_obj.sha,
+                    workflow_obj = repo.get_contents(workflow_path)
+                    # Handle both single file and list responses
+                    if isinstance(workflow_obj, list) and len(workflow_obj) > 0:
+                        workflow_obj = workflow_obj[0]
+
+                    if workflow_obj and hasattr(workflow_obj, "sha"):
+                        workflow_exists = True
+                        workflow_sha = workflow_obj.sha
+                        logger.info(
+                            f"Workflow file {workflow_path} already exists, will update (SHA: {workflow_sha})"
                         )
-                        logger.info(f"Updated workflow file: {workflow_path}")
                     else:
-                        logger.error(f"Error creating workflow: {str(workflow_error)}")
-                        raise
+                        logger.info(
+                            f"Workflow file {workflow_path} exists but no SHA found, will create"
+                        )
+                except Exception as e:
+                    workflow_exists = False
+                    logger.info(
+                        f"Workflow file {workflow_path} doesn't exist, will create (Error: {str(e)})"
+                    )
+
+                try:
+                    # Create or update workflow file
+                    if workflow_exists and workflow_sha:
+                        # File exists, update it
+                        logger.info(
+                            f"Updating existing workflow file: {workflow_path} with SHA: {workflow_sha}"
+                        )
+                        repo.update_file(
+                            path=workflow_path,
+                            message="Update GitHub Pages workflow",
+                            content=workflow_content,
+                            sha=workflow_sha,
+                        )
+                        logger.info(
+                            f"Successfully updated workflow file: {workflow_path}"
+                        )
+                    else:
+                        # File doesn't exist, create it
+                        logger.info(f"Creating new workflow file: {workflow_path}")
+                        repo.create_file(
+                            path=workflow_path,
+                            message="Add GitHub Pages workflow",
+                            content=workflow_content,
+                        )
+                        logger.info(
+                            f"Successfully created workflow file: {workflow_path}"
+                        )
+
+                except Exception as workflow_error:
+                    logger.error(
+                        f"Error handling workflow file {workflow_path}: {str(workflow_error)}"
+                    )
+                    raise
 
             logger.info("Successfully uploaded all files individually")
 

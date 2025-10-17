@@ -1,12 +1,15 @@
 import logging
 from typing import List, Dict, Any
 from github.Repository import Repository
+from github import InputGitTreeElement
 from langchain.tools import tool
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from dotenv import load_dotenv
 from logger import telegram_logger
+import os
 
 load_dotenv(override=True)
 
@@ -23,6 +26,8 @@ class AgentTools:
     def __init__(self, repo: Repository):
         self.repo = repo
         self.logger = logging.getLogger(__name__)
+        self.staged_changes = {}  # Store file changes locally before committing
+        self.staged_deletions = set()  # Store files to delete
 
     def read_files(self, file_names: List[str]) -> Dict[str, str]:
         """
@@ -63,9 +68,9 @@ class AgentTools:
 
         return file_contents
 
-    def update_files(self, file_updates: List[Dict[str, str]]) -> Dict[str, bool]:
+    def stage_file_changes(self, file_updates: List[Dict[str, str]]) -> Dict[str, bool]:
         """
-        Update or create files in the repository with new content.
+        Stage files for later commit instead of immediately updating the repository.
 
         Args:
             file_updates: List of dictionaries with 'file_name' and 'content' keys
@@ -85,40 +90,32 @@ class AgentTools:
                 continue
 
             try:
-                # Check if file exists
-                try:
-                    existing_file = self.repo.get_contents(file_name)
-
-                    # Handle list case
-                    if isinstance(existing_file, list):
-                        if len(existing_file) > 0:
-                            existing_file = existing_file[0]
-                        else:
-                            raise Exception("File not found")
-
-                    # File exists, update it
-                    self.repo.update_file(
-                        path=file_name,
-                        message=f"Update {file_name}",
-                        content=content,
-                        sha=existing_file.sha,
-                    )
-                    self.logger.info(f"Successfully updated file: {file_name}")
-
-                except Exception:
-                    # File doesn't exist, create it
-                    self.repo.create_file(
-                        path=file_name, message=f"Create {file_name}", content=content
-                    )
-                    self.logger.info(f"Successfully created file: {file_name}")
-
+                # Stage the file change locally
+                self.staged_changes[file_name] = content
                 results[file_name] = True
+                self.logger.info(f"Staged file change: {file_name}")
 
             except Exception as e:
                 results[file_name] = False
-                self.logger.error(f"Error updating file {file_name}: {str(e)}")
+                self.logger.error(f"Error staging file {file_name}: {str(e)}")
 
         return results
+
+    def update_files(self, file_updates: List[Dict[str, str]]) -> Dict[str, bool]:
+        """
+        DEPRECATED: Use stage_file_changes instead for batch operations.
+        Update or create files in the repository with new content.
+
+        Args:
+            file_updates: List of dictionaries with 'file_name' and 'content' keys
+
+        Returns:
+            Dictionary mapping file names to success status
+        """
+        self.logger.warning(
+            "update_files is deprecated. Use stage_file_changes for batch operations."
+        )
+        return self.stage_file_changes(file_updates)
 
     def list_directory_contents(self, path: str = "") -> Dict[str, Any]:
         """
@@ -170,7 +167,7 @@ class AgentTools:
 
     def delete_file(self, file_path: str) -> bool:
         """
-        Delete a file from the repository.
+        Stage a file for deletion instead of immediately deleting it.
 
         Args:
             file_path: Path to the file to delete
@@ -179,27 +176,226 @@ class AgentTools:
             True if successful, False otherwise
         """
         try:
-            # Get file to get its SHA
-            file_content = self.repo.get_contents(file_path)
+            # Stage the file for deletion
+            self.staged_deletions.add(file_path)
+            # Remove from staged changes if it was added
+            if file_path in self.staged_changes:
+                del self.staged_changes[file_path]
 
-            # Handle list case
-            if isinstance(file_content, list):
-                if len(file_content) > 0:
-                    file_content = file_content[0]
-                else:
-                    raise Exception("File not found")
-
-            # Delete the file
-            self.repo.delete_file(
-                path=file_path, message=f"Delete {file_path}", sha=file_content.sha
-            )
-
-            self.logger.info(f"Successfully deleted file: {file_path}")
+            self.logger.info(f"Staged file for deletion: {file_path}")
             return True
 
         except Exception as e:
-            self.logger.error(f"Error deleting file {file_path}: {str(e)}")
+            self.logger.error(f"Error staging file deletion {file_path}: {str(e)}")
             return False
+
+    def commit_and_push(self, commit_message: str) -> Dict[str, Any]:
+        """
+        Commit all staged changes and deletions in a single commit and push to GitHub.
+
+        Args:
+            commit_message: The commit message to use
+
+        Returns:
+            Dictionary with commit information and success status
+        """
+        try:
+            if not self.staged_changes and not self.staged_deletions:
+                return {
+                    "success": True,
+                    "message": "No changes to commit",
+                    "commit_sha": None,
+                    "files_modified": 0,
+                    "files_created": 0,
+                    "files_deleted": 0,
+                }
+
+            self.logger.info(
+                f"Committing {len(self.staged_changes)} file changes and {len(self.staged_deletions)} deletions"
+            )
+
+            # Get the latest commit SHA and base tree
+            try:
+                ref = self.repo.get_git_ref("heads/main")
+                latest_commit_sha = ref.object.sha
+                base_tree = self.repo.get_git_commit(latest_commit_sha).tree
+            except Exception:
+                # Repository might not have main branch yet
+                latest_commit_sha = None
+                base_tree = None
+
+            # Prepare tree elements for all changes
+            tree_elements = []
+            files_created = 0
+            files_modified = 0
+
+            # Process file changes
+            for file_path, content in self.staged_changes.items():
+                try:
+                    # Check if file exists to determine if it's create or update
+                    try:
+                        existing_file = self.repo.get_contents(file_path)
+                        if isinstance(existing_file, list) and len(existing_file) > 0:
+                            existing_file = existing_file[0]
+                        files_modified += 1
+                    except Exception:
+                        files_created += 1
+
+                    # Add to tree using InputGitTreeElement format
+                    blob = self.repo.create_git_blob(content, "utf-8")
+                    tree_element = InputGitTreeElement(
+                        path=file_path,
+                        mode="100644",
+                        type="blob",
+                        sha=blob.sha,
+                    )
+                    tree_elements.append(tree_element)
+
+                except Exception as e:
+                    self.logger.error(f"Error processing file {file_path}: {str(e)}")
+                    continue
+
+            # Process file deletions
+            files_deleted = 0
+            for file_path in self.staged_deletions:
+                try:
+                    # Check if file actually exists before staging deletion
+                    existing_file = self.repo.get_contents(file_path)
+                    if isinstance(existing_file, list) and len(existing_file) > 0:
+                        existing_file = existing_file[0]
+
+                    # Stage deletion by not including the file in the new tree
+                    # (GitHub API handles this automatically when file is not in tree)
+                    files_deleted += 1
+
+                except Exception:
+                    # File doesn't exist, nothing to delete
+                    self.logger.warning(
+                        f"File {file_path} does not exist, cannot delete"
+                    )
+
+            # Create new tree
+            try:
+                if base_tree:
+                    # When using base_tree, we need to pass it as a parameter
+                    new_tree = self.repo.create_git_tree(tree_elements, base_tree)
+                else:
+                    new_tree = self.repo.create_git_tree(tree_elements)
+
+                self.logger.info(
+                    f"Successfully created tree with {len(tree_elements)} elements"
+                )
+
+            except Exception as tree_error:
+                self.logger.error(f"Failed to create git tree: {str(tree_error)}")
+                self.logger.error(f"Tree elements: {tree_elements}")
+                # Log more details about the error
+                if hasattr(tree_error, "data"):
+                    self.logger.error(f"Error data: {tree_error.data}")
+                raise Exception(f"Failed to create git tree: {str(tree_error)}")
+
+            # Create commit
+            if latest_commit_sha:
+                parent = self.repo.get_git_commit(latest_commit_sha)
+                new_commit = self.repo.create_git_commit(
+                    commit_message, new_tree, [parent]
+                )
+            else:
+                new_commit = self.repo.create_git_commit(commit_message, new_tree, [])
+
+            # Update the main branch reference
+            try:
+                self.repo.get_git_ref("heads/main").edit(new_commit.sha)
+            except Exception:
+                # Create main branch if it doesn't exist
+                self.repo.create_git_ref("refs/heads/main", new_commit.sha)
+
+            # Clear staged changes
+            self.staged_changes.clear()
+            self.staged_deletions.clear()
+
+            result = {
+                "success": True,
+                "message": f"Successfully committed {files_created + files_modified + files_deleted} changes",
+                "commit_sha": new_commit.sha,
+                "files_created": files_created,
+                "files_modified": files_modified,
+                "files_deleted": files_deleted,
+                "total_changes": files_created + files_modified + files_deleted,
+            }
+
+            self.logger.info(f"Successfully committed and pushed: {result}")
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Error committing and pushing changes: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": f"Failed to commit and push: {str(e)}",
+                "commit_sha": None,
+            }
+
+    def get_build_errors(self) -> Dict[str, Any]:
+        """
+        Get the latest workflow run errors if any builds failed.
+
+        Returns:
+            Dictionary with build error information
+        """
+        try:
+            workflows = self.repo.get_workflow_runs()
+
+            if workflows.totalCount == 0:
+                return {"has_errors": False, "message": "No workflow runs found"}
+
+            latest_run = workflows[0]
+
+            if latest_run.status == "completed" and latest_run.conclusion == "failure":
+                # Get job details for more specific error information
+                jobs = latest_run.jobs()
+                error_details = []
+
+                for job in jobs:
+                    if job.conclusion == "failure":
+                        error_details.append(
+                            {
+                                "job_name": job.name,
+                                "conclusion": job.conclusion,
+                                "started_at": str(job.started_at),
+                                "completed_at": str(job.completed_at),
+                            }
+                        )
+
+                return {
+                    "has_errors": True,
+                    "run_id": latest_run.id,
+                    "conclusion": latest_run.conclusion,
+                    "html_url": latest_run.html_url,
+                    "error_details": error_details,
+                    "message": f"Build failed with conclusion: {latest_run.conclusion}",
+                }
+
+            elif latest_run.status == "in_progress":
+                return {
+                    "has_errors": False,
+                    "message": "Build is still in progress",
+                    "status": latest_run.status,
+                }
+
+            else:
+                return {
+                    "has_errors": False,
+                    "message": f"Build completed successfully with status: {latest_run.status}, conclusion: {latest_run.conclusion}",
+                }
+
+        except Exception as e:
+            self.logger.error(f"Error getting build errors: {str(e)}")
+            return {
+                "has_errors": False,
+                "error": str(e),
+                "message": f"Could not check build status: {str(e)}",
+            }
 
     def get_repository_tree(self) -> Dict[str, Any]:
         """
@@ -486,12 +682,22 @@ class WebsiteAgent:
     def __init__(self, tools: AgentTools):
         self.tools = tools
         self.logger = logging.getLogger(__name__)
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+        self.llm = ChatOpenAI(model="gpt-5-mini")
+        # self.llm = AzureChatOpenAI(
+        #     # deployment_name=os.getenv("AZURE_OPENAI_MODEL"),
+        #     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        #     base_url=os.getenv("AZURE_OPENAI_BASE_URL"),
+        #     api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+        # )
+        # self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
         agent_tools = [
             tool(self.tools.read_files),
-            tool(self.tools.update_files),
+            tool(self.tools.stage_file_changes),
+            # tool(self.tools.update_files),  # Keep for backward compatibility
             tool(self.tools.list_directory_contents),
             tool(self.tools.delete_file),
+            tool(self.tools.commit_and_push),
+            tool(self.tools.get_build_errors),
             tool(self.tools.get_repository_tree),
             tool(self.tools.get_repository_context),
             tool(self.tools.get_formatted_directory_tree),
@@ -553,14 +759,17 @@ Your responsibilities (follow exactly, word-for-word):
 to ensure you understand the data shape before using it.
 - Use the provided repository context and directory tree as your working state. Do not assume files not
 included in the context exist; use tools to read additional files if needed.
-- Only modify repository files necessary to satisfy the brief and checks. Do NOT modify the existing
-GitHub Actions workflow at `.github/workflows/pages.yml`.
+- Only modify repository files necessary to satisfy the brief and checks. Only modify the existing
+GitHub Actions workflow at `.github/workflows/pages.yml` if either the build is not working or the tech stack is different or the workflow needs some changes to be made for the pages..
 - Produce clean, well-structured, idiomatic code. Make minimal, focused changes with clear intent.
 - After making code changes, update or create a high-quality `README.md` that includes: summary, setup,
 usage, code explanation, and license. The README must be detailed and helpful for reviewers and graders.
 - When updating files, ensure you include comments where non-obvious logic is added.
 
 Output and tool usage rules:
+- Use stage_file_changes to stage all file modifications (create or update).
+- Use delete_file to stage file deletions.
+- IMPORTANT: When you have finished making ALL changes for this round, call commit_and_push with a descriptive commit message.
 - Use the provided tools to read or update files. If you need to examine more files than provided in the
 <current_repository_context>, call the read_files tool for the exact file path.
 - When you finish all changes, create or update `README.md` to document what you changed and why, and how
@@ -573,11 +782,14 @@ Quality gates:
 - Keep changes minimal and well-tested. If you add JS/HTML/CSS, make them robust against missing data.
 
 Final README expectations:
-- Concise summary of the app and what changed
+- Concise summary of the app
+- Tech Stack
+- Directory Structure
 - Clear setup steps (how to open locally or what the Pages URL will show)
 - Usage examples including how to use attachments or URL query params if applicable
 - Code explanation (files changed and why)
 - License section (MIT)
+- Use mermaid to show the flow and other diagrams since the readme will be rendered on GitHub.
 
 Follow these instructions exactly. Use the tools to inspect the current repo state when in doubt.
 """
@@ -662,6 +874,29 @@ Requirements to fulfill:
             for att in context["attachments"]:
                 formatted_context += f"- {att['name']}\n"
 
+        # Add build error context if this is a retry
+        if context.get("build_errors"):
+            build_errors = context["build_errors"]
+            if build_errors.get("has_errors"):
+                formatted_context += "\n**IMPORTANT: Previous build failed - please fix these issues:**\n"
+                formatted_context += (
+                    f"Build conclusion: {build_errors.get('conclusion')}\n"
+                )
+                formatted_context += f"Error details: {build_errors.get('message')}\n"
+                if build_errors.get("error_details"):
+                    formatted_context += "Failed jobs:\n"
+                    for job in build_errors["error_details"]:
+                        formatted_context += (
+                            f"- {job['job_name']}: {job['conclusion']}\n"
+                        )
+                formatted_context += (
+                    f"Build URL: {build_errors.get('html_url', 'N/A')}\n\n"
+                )
+
+        # Add retry attempt info
+        if context.get("retry_attempt", 0) > 0:
+            formatted_context += f"\nThis is retry attempt #{context['retry_attempt']} - previous attempts failed.\n\n"
+
         # Add current repository context
         try:
             repo_context = self.tools.get_repository_context(10000)
@@ -701,14 +936,34 @@ Requirements to fulfill:
             try:
                 if tool_name == "read_files":
                     result = self.tools.read_files(tool_args.get("file_names", []))
+                elif tool_name == "stage_file_changes":
+                    result = self.tools.stage_file_changes(
+                        tool_args.get("file_updates", [])
+                    )
                 elif tool_name == "update_files":
                     result = self.tools.update_files(tool_args.get("file_updates", []))
+                elif tool_name == "commit_and_push":
+                    result = self.tools.commit_and_push(
+                        tool_args.get("commit_message", "Update files")
+                    )
+                elif tool_name == "get_build_errors":
+                    result = self.tools.get_build_errors()
                 elif tool_name == "list_directory_contents":
                     result = self.tools.list_directory_contents(
                         tool_args.get("path", "")
                     )
                 elif tool_name == "delete_file":
                     result = self.tools.delete_file(tool_args.get("file_path", ""))
+                elif tool_name == "get_repository_tree":
+                    result = self.tools.get_repository_tree()
+                elif tool_name == "get_repository_context":
+                    result = self.tools.get_repository_context(
+                        tool_args.get("max_chars", 2000)
+                    )
+                elif tool_name == "get_formatted_directory_tree":
+                    result = self.tools.get_formatted_directory_tree(
+                        tool_args.get("path", "")
+                    )
                 else:
                     result = {"error": f"Unknown tool: {tool_name}"}
 
