@@ -3,6 +3,8 @@ import asyncio
 import httpx
 import logging
 import base64
+import hashlib
+import time
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from github import Github
 from models import BuildRequest, BuildResponse, EvaluationPayload
@@ -338,6 +340,234 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
+    async def upload_files_single_commit(
+        self, repo, app_files: dict, is_first_round: bool
+    ):
+        """Upload all files in a single commit using Git API."""
+        try:
+            # Get the main branch
+            default_branch = repo.default_branch or "main"
+
+            # Get the latest commit SHA and base tree
+            try:
+                ref = repo.get_git_ref(f"heads/{default_branch}")
+                latest_commit_sha = ref.object.sha
+                base_tree = repo.get_git_commit(latest_commit_sha).tree
+            except Exception:
+                # Empty repo or no base tree
+                latest_commit_sha = None
+                base_tree = None
+
+            # Prepare all files to upload
+            files_to_upload = []
+
+            # 1. Add app files
+            for filename, content in app_files.items():
+                # Determine if content is binary or text
+                if isinstance(content, bytes):
+                    files_to_upload.append(
+                        {"path": filename, "content": content, "encoding": "base64"}
+                    )
+                else:
+                    files_to_upload.append(
+                        {"path": filename, "content": content, "encoding": "utf-8"}
+                    )
+
+            # 2. Add GitHub Actions workflow for Pages (only on first round)
+            if is_first_round:
+                workflow_content = self.get_github_pages_workflow()
+                files_to_upload.append(
+                    {
+                        "path": ".github/workflows/pages.yml",
+                        "content": workflow_content,
+                        "encoding": "utf-8",
+                    }
+                )
+
+            # Create blobs for all files
+            element_list = []
+            for file_info in files_to_upload:
+                # Handle different content types properly
+                if file_info["encoding"] == "base64":
+                    # For binary content, encode as base64
+                    content_b64 = base64.b64encode(file_info["content"]).decode('utf-8')
+                    blob = repo.create_git_blob(content_b64, "base64")
+                else:
+                    # For text content, use UTF-8
+                    blob = repo.create_git_blob(file_info["content"], "utf-8")
+                
+                element = {
+                    "path": file_info["path"],
+                    "mode": "100644",  # File mode
+                    "type": "blob",
+                    "sha": blob.sha,
+                }
+                element_list.append(element)
+                logger.info(f"Prepared file: {file_info['path']} ({file_info['encoding']})")
+
+            # Create tree
+            if base_tree:
+                tree = repo.create_git_tree(element_list, base_tree)
+            else:
+                tree = repo.create_git_tree(element_list)
+
+            # Create commit
+            commit_message = f"{'Initial commit' if is_first_round else 'Update'}: Add application files{'and workflow' if is_first_round else ''}"
+            if latest_commit_sha:
+                parent = repo.get_git_commit(latest_commit_sha)
+                commit = repo.create_git_commit(commit_message, tree, [parent])
+            else:
+                commit = repo.create_git_commit(commit_message, tree, [])
+
+            # Update reference
+            try:
+                ref = repo.get_git_ref(f"heads/{default_branch}")
+                ref.edit(commit.sha)
+            except Exception:
+                # Create the reference if it doesn't exist
+                repo.create_git_ref(f"refs/heads/{default_branch}", commit.sha)
+
+            logger.info(
+                f"Successfully uploaded {len(files_to_upload)} files in a single commit"
+            )
+
+        except Exception as e:
+            logger.error(f"Error uploading files in single commit: {str(e)}")
+            raise
+
+    async def upload_files_individually(
+        self, repo, app_files: dict, is_first_round: bool
+    ):
+        """Upload files one by one to ensure they work."""
+        try:
+            logger.info("Uploading files individually...")
+            
+            # Upload app files
+            for filename, content in app_files.items():
+                try:
+                    # Check if file already exists
+                    file_exists = False
+                    file_sha = None
+                    try:
+                        file_obj = repo.get_contents(filename)
+                        if file_obj and hasattr(file_obj, 'sha'):
+                            file_exists = True
+                            file_sha = file_obj.sha
+                            logger.info(f"File {filename} already exists, will update")
+                        else:
+                            logger.info(f"File {filename} exists but no SHA found, will create")
+                    except Exception:
+                        file_exists = False
+                        logger.info(f"File {filename} doesn't exist, will create")
+
+                    # Prepare content based on type
+                    final_content = None
+                    if isinstance(content, bytes):
+                        # Handle binary files (like CSV) - convert to text first
+                        try:
+                            # Try to decode as UTF-8 first
+                            final_content = content.decode('utf-8')
+                        except UnicodeDecodeError:
+                            # If UTF-8 fails, use base64 encoding
+                            final_content = base64.b64encode(content).decode('utf-8')
+                    else:
+                        # Handle text files
+                        final_content = content
+
+                    # Create or update file
+                    if file_exists and file_sha:
+                        repo.update_file(
+                            filename,
+                            f"Update {filename}",
+                            final_content,
+                            file_sha
+                        )
+                        logger.info(f"Updated file: {filename}")
+                    else:
+                        repo.create_file(
+                            filename,
+                            f"Add {filename}",
+                            final_content
+                        )
+                        logger.info(f"Created file: {filename}")
+
+                except Exception as file_error:
+                    logger.error(f"Error handling {filename}: {str(file_error)}")
+                    raise
+
+            # Add GitHub Actions workflow for Pages (only on first round)
+            if is_first_round:
+                workflow_content = self.get_github_pages_workflow()
+                workflow_path = ".github/workflows/pages.yml"
+                try:
+                    repo.create_file(
+                        workflow_path,
+                        "Add GitHub Pages workflow",
+                        workflow_content
+                    )
+                    logger.info(f"Added workflow file: {workflow_path}")
+                except Exception as workflow_error:
+                    if "already exists" in str(workflow_error):
+                        # Update existing workflow
+                        file_obj = repo.get_contents(workflow_path)
+                        repo.update_file(
+                            workflow_path,
+                            "Update GitHub Pages workflow",
+                            workflow_content,
+                            file_obj.sha
+                        )
+                        logger.info(f"Updated workflow file: {workflow_path}")
+                    else:
+                        logger.error(f"Error creating workflow: {str(workflow_error)}")
+                        raise
+
+            logger.info("Successfully uploaded all files individually")
+
+        except Exception as e:
+            logger.error(f"Error uploading files individually: {str(e)}")
+            raise
+
+    def get_github_pages_workflow(self) -> str:
+        """Get the GitHub Pages workflow YAML content."""
+        return """name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+        
+      - name: Upload Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+          
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+"""
+
     async def create_github_repository(
         self, task_name: str, app_files: dict, email: str = "", round_num: int = 1
     ):
@@ -372,69 +602,40 @@ SOFTWARE."""
                     task_info = None  # Reset to create new repo
 
             if not task_info:
-                # Create new repository
+                # Create new repository with unique name if needed
                 logger.info(f"Creating new repository: {repo_name}")
-                try:
-                    repo = user.create_repo(
-                        repo_name,
-                        description=f"Auto-generated web application for {task_name}",
-                        private=False,
-                        auto_init=True,
-                    )
-                except Exception as create_error:
-                    # Repository might already exist on GitHub but not in our CSV
-                    if "already exists" in str(create_error):
-                        logger.info(
-                            f"Repository exists on GitHub, fetching it: {repo_name}"
-                        )
-                        repo = self.github_client.get_repo(f"{user.login}/{repo_name}")
-                    else:
-                        raise
-
-            # Push files to repository
-            for filename, content in app_files.items():
-                try:
-                    repo.create_file(
-                        filename, f"Add {filename}", content, branch="main"
-                    )
-                except Exception:
+                repo = None
+                attempts = 0
+                max_attempts = 5
+                
+                while repo is None and attempts < max_attempts:
                     try:
-                        existing_file = repo.get_contents(filename)
-                        if isinstance(existing_file, list):
-                            existing_file = existing_file[0]
-                        repo.update_file(
-                            filename,
-                            f"Update {filename}",
-                            content,
-                            existing_file.sha,
-                            branch="main",
+                        repo = user.create_repo(
+                            repo_name,
+                            description=f"Auto-generated web application for {task_name}",
+                            private=False,
+                            auto_init=False,  # Don't auto-init to avoid conflicts
                         )
-                    except Exception:
-                        logger.warning(f"Could not create or update {filename}")
-                        continue
+                        logger.info(f"Successfully created repository: {repo_name}")
+                    except Exception as create_error:
+                        if "already exists" in str(create_error):
+                            # Generate unique name with timestamp
+                            timestamp = str(int(time.time()))[-6:]  # Last 6 digits of timestamp
+                            repo_name = f"generated-{task_name}-{timestamp}"
+                            logger.info(f"Repository exists, trying with unique name: {repo_name}")
+                            attempts += 1
+                        else:
+                            logger.error(f"Error creating repository: {str(create_error)}")
+                            raise
 
-            # Enable GitHub Pages using REST API (only for new repos)
-            if not task_info or round_num == 1:
-                import requests
+                if repo is None:
+                    raise Exception(f"Failed to create repository after {max_attempts} attempts")
 
-                token = self.github_token
-                api_url = f"https://api.github.com/repos/{user.login}/{repo_name}/pages"
-                headers = {
-                    "Accept": "application/vnd.github+json",
-                    "Authorization": f"Bearer {token}",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                }
-                data = {
-                    "build_type": "workflow",
-                    "source": {"branch": "main", "path": "/"},
-                }
-                response = requests.post(api_url, headers=headers, json=data)
-                if response.status_code == 201:
-                    logger.info(f"GitHub Pages enabled for {repo_name}")
-                else:
-                    logger.warning(
-                        f"Failed to enable GitHub Pages: {response.status_code} {response.text}"
-                    )
+            # Upload files one by one (temporary fix)
+            await self.upload_files_individually(repo, app_files, round_num == 1)
+
+            # Enable GitHub Pages for the repository
+            await self.enable_github_pages_api(repo)
 
             # Get the latest commit SHA
             commits = repo.get_commits()
@@ -487,6 +688,46 @@ SOFTWARE."""
 
         except Exception as e:
             logger.error(f"Error setting up GitHub Pages: {str(e)}")
+            # Don't raise here as this might not be critical
+
+    async def enable_github_pages_api(self, repo):
+        """Enable GitHub Pages using GitHub API."""
+        try:
+            logger.info(f"Enabling GitHub Pages for repository: {repo.name}")
+            
+            # Use GitHub API to enable Pages
+            # We need to use the raw API since PyGithub doesn't have direct Pages support
+            
+            headers = {
+                "Authorization": f"token {self.github_token}",
+                "Accept": "application/vnd.github.v3+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            }
+            
+            # Enable Pages with GitHub Actions as source
+            pages_config = {
+                "source": {
+                    "branch": "main",
+                    "path": "/"
+                },
+                "build_type": "workflow"  # Use GitHub Actions workflow
+            }
+            
+            url = f"https://api.github.com/repos/{repo.full_name}/pages"
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=pages_config, headers=headers)
+                
+                if response.status_code == 201:
+                    logger.info("GitHub Pages enabled successfully")
+                elif response.status_code == 409:
+                    logger.info("GitHub Pages already enabled")
+                else:
+                    logger.warning(f"Pages enablement returned status: {response.status_code}")
+                    logger.debug(f"Response: {response.text}")
+                    
+        except Exception as e:
+            logger.warning(f"Could not enable GitHub Pages via API: {str(e)}")
             # Don't raise here as this might not be critical
 
     async def wait_and_post_results(self, request: BuildRequest, repo_info: dict):

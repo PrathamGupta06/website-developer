@@ -288,87 +288,25 @@ class WebsiteAgent:
         )
 
         SYSTEM_PROMPT = """
-        You have to make the changes, be specific about the tasks that is given to you and make sure that your generated code passes the test cases, 
-        also create the workflow file for your website so that it is deployed on github pages.
-        Don't ask questions, give your best attempt.
+        You have to make the changes, be specific about the tasks that is given to you and make sure that your generated code passes the test cases.
+        
+        IMPORTANT: A GitHub Pages workflow file already exists at `.github/workflows/pages.yml` - DO NOT create or modify it.
+        The workflow is already configured to deploy your changes automatically when you commit to the main branch.
+        
+        Your job is to:
         1. Analyze the brief and requirements
         2. Use the tools to read current repository state
-        3. Generate/update appropriate files
+        3. Generate/update appropriate HTML, CSS, JS files
         4. Use tools to update the repository
+        5. DO NOT touch the workflow file - it's already set up correctly
 
-        It is important to create the workflow file once all the code is written.
-        Github Workflow Documentation for Pages:
+        The existing workflow configuration:
+        - Triggers on push to main branch
+        - Deploys all files in the repository to GitHub Pages
+        - Handles both static files and any build artifacts
+        - Already has proper permissions configured
 
-        ```
-        You can link your build and deploy jobs in a single workflow file, eliminating the need to create two separate files to get the same result. To get started on your workflow file, under jobs you can define a build and deploy job to execute your jobs.
-
-# ...
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-jobs:
-  # Build job
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-      - name: Setup Pages
-        id: pages
-        uses: actions/configure-pages@v5
-      - name: Build with Jekyll
-        uses: actions/jekyll-build-pages@v1
-        with:
-          source: ./
-          destination: ./_site
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v4
-
-  # Deployment job
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{steps.deployment.outputs.page_url}}
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-# ...
-In certain cases, you might choose to combine everything into a single job, especially if there is no need for a build process. Consequently, you would solely focus on the deployment step.
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-# ...
-
-jobs:
-  # Single deploy job no building
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{steps.deployment.outputs.page_url}}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
-      - name: Upload Artifact
-        uses: actions/upload-pages-artifact@v4
-        with:
-          # upload entire directory
-          path: '.'
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-# ...
-```
+        Focus on creating high-quality, functional web applications that meet the requirements.
         """
         inputs = [
             SystemMessage(content=SYSTEM_PROMPT),
@@ -421,23 +359,6 @@ Requirements to fulfill:
             formatted_context += str(context["current_repo_state"])
 
         return formatted_context
-
-    def _extract_tool_calls_from_response(
-        self, llm_response: str
-    ) -> List[Dict[str, Any]]:
-        """
-        Extract tool calls from LLM response.
-
-        Args:
-            llm_response: Raw response from LLM
-
-        Returns:
-            List of tool calls to execute
-        """
-        # TODO: Implement parsing logic based on your LLM's output format
-        # This should extract structured tool calls from the LLM response
-
-        return []
 
     async def _execute_tool_calls(
         self, tool_calls: List[Dict[str, Any]]
