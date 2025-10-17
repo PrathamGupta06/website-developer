@@ -41,7 +41,7 @@ def test_api():
         print("Sending POST request to /build endpoint...")
 
         response = requests.post(
-            "http://tds.pratham.eu.org/build",
+            "http://localhost:8000/build",
             json=test_request,
             headers={"Content-Type": "application/json"},
             timeout=10,
@@ -64,7 +64,7 @@ def test_api():
 def test_health():
     """Test the health endpoint."""
     try:
-        response = requests.get("http://tds.pratham.eu.org/health")
+        response = requests.get("http://localhost:8000/health")
         print(f"Health check: {response.status_code} - {response.json()}")
     except Exception as e:
         print(f"Health check failed: {str(e)}")

@@ -3,10 +3,10 @@ import asyncio
 import httpx
 import logging
 from github import Github
-from models import BuildRequest, EvaluationPayload
+from models import BuildRequest
 from agent import AgentTools, WebsiteAgent
+from db import TaskRepository
 import base64
-import time
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,7 @@ class AppBuilder:
         self.github_token = os.getenv("GITHUB_TOKEN")
         self.valid_secret = os.getenv("API_SECRET", "default-secret")
         self.github_client = Github(self.github_token) if self.github_token else None
+        self.task_db = TaskRepository()  # Initialize CSV-based storage
 
     def validate_secret(self, provided_secret: str) -> bool:
         """Validate the provided secret against the expected secret."""
@@ -82,8 +83,8 @@ class AppBuilder:
             return None
 
         try:
-            # Create unique repo name
-            repo_name = f"generated-{task_name}-{int(time.time())}"
+            # Create unique repo name using task ID
+            repo_name = f"generated-{task_name}"
             logger.info(f"Creating repository: {repo_name}")
 
             # Create repository
@@ -113,21 +114,27 @@ class AppBuilder:
             raise
 
     async def get_existing_repository(self, task_name: str):
-        """Get existing repository for round 2+."""
+        """Get existing repository for round 2+ using task ID from CSV database."""
         if not self.github_client:
             logger.warning("GitHub token not configured")
             return None
 
         try:
-            user = self.github_client.get_user()
-            # Find repository by task name pattern
-            for repo in user.get_repos():
-                if f"generated-{task_name}" in repo.name:
-                    logger.info(f"Found existing repository: {repo.name}")
-                    return repo
+            # Look up repository by task ID in CSV database
+            task_info = self.task_db.get_repo_by_task(task_name)
 
-            logger.error(f"No existing repository found for task: {task_name}")
-            raise Exception(f"No existing repository found for task: {task_name}")
+            if not task_info:
+                logger.error(f"No existing repository found for task: {task_name}")
+                raise Exception(f"No existing repository found for task: {task_name}")
+
+            # Get the repository object from GitHub
+            user = self.github_client.get_user()
+            repo = self.github_client.get_repo(f"{user.login}/{task_info['repo_name']}")
+
+            logger.info(
+                f"Found existing repository: {repo.name} (Round {task_info['latest_round']})"
+            )
+            return repo
 
         except Exception as e:
             logger.error(f"Error finding existing repository: {str(e)}")
@@ -288,7 +295,7 @@ class AppBuilder:
 
     # Phase 6: Deployment & Evaluation Methods
     async def deploy_and_evaluate(self, request: BuildRequest, repo):
-        """Deploy to GitHub Pages and send evaluation results."""
+        """Deploy to GitHub Pages and save task-repo mapping to CSV."""
         if not repo:
             logger.warning("No repository available for deployment")
             return
@@ -297,35 +304,52 @@ class AppBuilder:
             # Wait for Pages to be ready
             pages_url = await self.wait_for_pages_deployment(repo)
 
-            # Create evaluation payload
-            evaluation_payload = EvaluationPayload(
-                email=request.email,
+            # Get latest commit SHA
+            commit_sha = repo.get_commits()[0].sha
+
+            # Save task-repository mapping to CSV database
+            self.task_db.save_task_repo(
                 task=request.task,
-                round=request.round,
-                nonce=request.nonce,
+                email=request.email,
+                repo_name=repo.name,
                 repo_url=repo.html_url,
-                commit_sha=repo.get_commits()[0].sha,
+                commit_sha=commit_sha,
                 pages_url=pages_url,
+                round_num=request.round,
+            )
+            logger.info(
+                f"Saved task-repo mapping for {request.task}, round {request.round}"
             )
 
-            # Send to evaluation URL
-            await self.post_evaluation_results_with_retry(
-                request.evaluation_url, evaluation_payload
-            )
+            # Skip evaluation as per requirements
+            logger.info(f"Skipping evaluation for task {request.task}")
 
         except Exception as e:
-            logger.error(f"Error in deployment and evaluation: {str(e)}")
+            logger.error(f"Error in deployment: {str(e)}")
             raise
 
     async def wait_for_pages_deployment(self, repo) -> str:
-        """Wait for GitHub Pages to be ready and return URL."""
+        """Wait for GitHub Actions workflow to complete and Pages to be ready."""
         if not self.github_client:
             return f"https://user.github.io/{repo.name}/"
 
         user_login = self.github_client.get_user().login
         pages_url = f"https://{user_login}.github.io/{repo.name}/"
 
-        # Try to verify Pages is accessible
+        logger.info("Waiting for GitHub Actions workflow to complete...")
+
+        # Step 1: Wait for workflow to complete
+        workflow_completed = await self.wait_for_workflow_completion(repo)
+
+        if not workflow_completed:
+            logger.warning(
+                "Workflow did not complete in time, but will try to access Pages"
+            )
+        else:
+            logger.info("GitHub Actions workflow completed successfully")
+
+        # Step 2: Wait for Pages to be accessible
+        logger.info("Waiting for GitHub Pages to be accessible...")
         max_attempts = 30  # 5 minutes with 10-second intervals
         for attempt in range(max_attempts):
             try:
@@ -334,8 +358,8 @@ class AppBuilder:
                     if response.status_code == 200:
                         logger.info(f"GitHub Pages is ready: {pages_url}")
                         return pages_url
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Pages not ready yet (attempt {attempt + 1}): {str(e)}")
 
             if attempt < max_attempts - 1:
                 await asyncio.sleep(10)
@@ -343,43 +367,108 @@ class AppBuilder:
         logger.warning(f"GitHub Pages may not be ready yet: {pages_url}")
         return pages_url
 
-    async def post_evaluation_results_with_retry(
-        self, evaluation_url, payload: EvaluationPayload
-    ):
-        """Post results to evaluation URL with retry logic."""
-        max_retries = 5
-        delay = 1
+    async def wait_for_workflow_completion(self, repo, timeout: int = 300) -> bool:
+        """
+        Wait for the GitHub Actions workflow to complete.
 
-        for attempt in range(max_retries):
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(
-                        str(evaluation_url),
-                        json=payload.dict(),
-                        headers={"Content-Type": "application/json"},
-                        timeout=30.0,
-                    )
+        Args:
+            repo: GitHub repository object
+            timeout: Maximum time to wait in seconds (default: 5 minutes)
 
-                    if response.status_code == 200:
+        Returns:
+            True if workflow completed successfully, False otherwise
+        """
+        try:
+            import time as time_module
+
+            start_time = time_module.time()
+
+            # Get the latest workflow run
+            logger.info(f"Checking workflow runs for repository: {repo.name}")
+
+            # Wait a bit for the workflow to start
+            await asyncio.sleep(5)
+
+            while time_module.time() - start_time < timeout:
+                try:
+                    # Get workflow runs for the repository
+                    workflows = repo.get_workflow_runs()
+
+                    if workflows.totalCount > 0:
+                        latest_run = workflows[0]  # Get the most recent workflow run
+
                         logger.info(
-                            f"Successfully posted evaluation results (attempt {attempt + 1})"
+                            f"Workflow status: {latest_run.status}, "
+                            f"conclusion: {latest_run.conclusion}"
                         )
-                        return
+
+                        # Check if workflow is completed
+                        if latest_run.status == "completed":
+                            if latest_run.conclusion == "success":
+                                logger.info("Workflow completed successfully!")
+                                return True
+                            else:
+                                logger.warning(
+                                    f"Workflow completed with conclusion: {latest_run.conclusion}"
+                                )
+                                return False
+
+                        # Workflow is still in progress
+                        logger.info(f"Workflow still {latest_run.status}, waiting...")
                     else:
-                        logger.warning(
-                            f"Evaluation URL returned {response.status_code}, retrying..."
-                        )
+                        logger.info("No workflow runs found yet, waiting...")
 
-            except Exception as e:
-                logger.error(
-                    f"Error posting to evaluation URL (attempt {attempt + 1}): {str(e)}"
-                )
+                except Exception as e:
+                    logger.debug(f"Error checking workflow status: {str(e)}")
 
-            if attempt < max_retries - 1:
-                await asyncio.sleep(delay)
-                delay *= 2  # Exponential backoff
+                # Wait before checking again
+                await asyncio.sleep(10)
 
-        logger.error("Failed to post evaluation results after all retries")
+            logger.warning(f"Workflow did not complete within {timeout} seconds")
+            return False
+
+        except Exception as e:
+            logger.error(f"Error waiting for workflow completion: {str(e)}")
+            return False
+
+    # NOTE: Evaluation methods kept for future use but currently skipped
+    # async def post_evaluation_results_with_retry(
+    #     self, evaluation_url, payload: EvaluationPayload
+    # ):
+    #     """Post results to evaluation URL with retry logic."""
+    #     max_retries = 5
+    #     delay = 1
+    #
+    #     for attempt in range(max_retries):
+    #         try:
+    #             async with httpx.AsyncClient() as client:
+    #                 response = await client.post(
+    #                     str(evaluation_url),
+    #                     json=payload.dict(),
+    #                     headers={"Content-Type": "application/json"},
+    #                     timeout=30.0,
+    #                 )
+    #
+    #                 if response.status_code == 200:
+    #                     logger.info(
+    #                         f"Successfully posted evaluation results (attempt {attempt + 1})"
+    #                     )
+    #                     return
+    #                 else:
+    #                     logger.warning(
+    #                         f"Evaluation URL returned {response.status_code}, retrying..."
+    #                     )
+    #
+    #         except Exception as e:
+    #             logger.error(
+    #                 f"Error posting to evaluation URL (attempt {attempt + 1}): {str(e)}"
+    #             )
+    #
+    #         if attempt < max_retries - 1:
+    #             await asyncio.sleep(delay)
+    #             delay *= 2  # Exponential backoff
+    #
+    #     logger.error("Failed to post evaluation results after all retries")
 
     # Helper Methods for Processing
     async def process_attachments(self, attachments):

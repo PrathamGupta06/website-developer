@@ -3,12 +3,12 @@ import asyncio
 import httpx
 import logging
 import base64
-import time
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from github import Github
 from models import BuildRequest, BuildResponse, EvaluationPayload
 from dotenv import load_dotenv
 from agent import WebsiteAgent, AgentTools
+from db import TaskRepository
 
 # Load environment variables from .env file
 load_dotenv(override=True)
@@ -34,6 +34,7 @@ class AppBuilder:
         self.github_token = os.getenv("GITHUB_TOKEN")
         self.valid_secret = os.getenv("API_SECRET", "default-secret")
         self.github_client = Github(self.github_token) if self.github_token else None
+        self.task_db = TaskRepository()  # Initialize CSV-based storage
 
     def validate_secret(self, provided_secret: str) -> bool:
         """Validate the provided secret against the expected secret."""
@@ -45,7 +46,9 @@ class AppBuilder:
         This is the main orchestration method.
         """
         try:
-            logger.info(f"Starting build process for {request.task}")
+            logger.info(
+                f"Starting build process for {request.task}, round {request.round}"
+            )
 
             # Step 1: Parse attachments and save them
             attachments_data = await self.process_attachments(request.attachments)
@@ -55,11 +58,17 @@ class AppBuilder:
                 request.brief, request.checks, attachments_data
             )
 
-            # Step 3: Create GitHub repository
-            repo_info = await self.create_github_repository(request.task, app_code)
+            # Step 3: Create or update GitHub repository (handles both round 1 and 2+)
+            repo_info = await self.create_github_repository(
+                request.task, app_code, request.email, request.round
+            )
 
-            # Step 4: Enable GitHub Pages
-            await self.enable_github_pages(repo_info["repo_name"])
+            if not repo_info:
+                logger.error("Failed to create/update repository")
+                return
+
+            # Step 4: Enable GitHub Pages (only needed for round 1, handled in create_github_repository)
+            # await self.enable_github_pages(repo_info["repo_name"])
 
             # Step 5: Enhance with AI agent (this is where the actual AI generation happens)
             if self.github_client:
@@ -68,12 +77,18 @@ class AppBuilder:
                     request.brief,
                     request.checks,
                     attachments_data,
+                    request.round,
                 )
 
-            # Step 6: Post results to evaluation URL
-            await self.post_evaluation_results(request, repo_info)
+            # Step 6: Wait for GitHub Actions workflow and Pages deployment
+            if self.github_client and request.evaluation_url:
+                await self.wait_and_post_results(request, repo_info)
+            else:
+                logger.info(f"Skipping evaluation for task {request.task}")
 
-            logger.info(f"Successfully completed build for {request.task}")
+            logger.info(
+                f"Successfully completed build for {request.task}, round {request.round}"
+            )
 
         except Exception as e:
             logger.error(f"Error in build process: {str(e)}")
@@ -141,7 +156,12 @@ class AppBuilder:
         return app_files
 
     async def enhance_with_agent(
-        self, repo_name: str, brief: str, checks: list, attachments_data: list
+        self,
+        repo_name: str,
+        brief: str,
+        checks: list,
+        attachments_data: list,
+        round_num: int = 1,
     ):
         """
         Use the WebsiteAgent to enhance the repository after initial creation.
@@ -167,7 +187,7 @@ class AppBuilder:
             context = {
                 "brief": brief,
                 "checks": checks,
-                "round": 1,  # This could be passed from the request
+                "round": round_num,  # Pass the actual round number
                 "attachments": attachments_data,
                 "task": repo_name,
                 "current_repo_state": None,  # Agent will read current state
@@ -318,7 +338,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE."""
 
-    async def create_github_repository(self, task_name: str, app_files: dict):
+    async def create_github_repository(
+        self, task_name: str, app_files: dict, email: str = "", round_num: int = 1
+    ):
         if not self.github_client:
             logger.warning("GitHub token not configured, skipping repo creation")
             return {
@@ -328,18 +350,46 @@ SOFTWARE."""
             }
 
         try:
-            # Create unique repo name
-            repo_name = f"generated-{task_name}-{int(time.time())}"
-            logger.info(f"Creating repository: {repo_name}")
-
-            # Create repository
+            # Check if repository already exists for this task
+            task_info = self.task_db.get_repo_by_task(task_name)
             user = self.github_client.get_user()
-            repo = user.create_repo(
-                repo_name,
-                description=f"Auto-generated web application for {task_name}",
-                private=False,
-                auto_init=True,
-            )
+            repo_name = f"generated-{task_name}"
+
+            if task_info:
+                # Repository exists, update it instead of creating new one
+                logger.info(
+                    f"Repository already exists for task {task_name}, updating it"
+                )
+                try:
+                    repo = self.github_client.get_repo(
+                        f"{user.login}/{task_info['repo_name']}"
+                    )
+                    repo_name = task_info["repo_name"]
+                except Exception as e:
+                    logger.warning(
+                        f"Could not find existing repo: {str(e)}, will create new one"
+                    )
+                    task_info = None  # Reset to create new repo
+
+            if not task_info:
+                # Create new repository
+                logger.info(f"Creating new repository: {repo_name}")
+                try:
+                    repo = user.create_repo(
+                        repo_name,
+                        description=f"Auto-generated web application for {task_name}",
+                        private=False,
+                        auto_init=True,
+                    )
+                except Exception as create_error:
+                    # Repository might already exist on GitHub but not in our CSV
+                    if "already exists" in str(create_error):
+                        logger.info(
+                            f"Repository exists on GitHub, fetching it: {repo_name}"
+                        )
+                        repo = self.github_client.get_repo(f"{user.login}/{repo_name}")
+                    else:
+                        raise
 
             # Push files to repository
             for filename, content in app_files.items():
@@ -363,35 +413,56 @@ SOFTWARE."""
                         logger.warning(f"Could not create or update {filename}")
                         continue
 
-            # Enable GitHub Pages using REST API
-            import requests
+            # Enable GitHub Pages using REST API (only for new repos)
+            if not task_info or round_num == 1:
+                import requests
 
-            token = self.github_token
-            api_url = f"https://api.github.com/repos/{user.login}/{repo_name}/pages"
-            headers = {
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {token}",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }
-            data = {"build_type": "workflow", "source": {"branch": "main", "path": "/"}}
-            response = requests.post(api_url, headers=headers, json=data)
-            if response.status_code == 201:
-                logger.info(f"GitHub Pages enabled for {repo_name}")
-            else:
-                logger.warning(
-                    f"Failed to enable GitHub Pages: {response.status_code} {response.text}"
-                )
+                token = self.github_token
+                api_url = f"https://api.github.com/repos/{user.login}/{repo_name}/pages"
+                headers = {
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                }
+                data = {
+                    "build_type": "workflow",
+                    "source": {"branch": "main", "path": "/"},
+                }
+                response = requests.post(api_url, headers=headers, json=data)
+                if response.status_code == 201:
+                    logger.info(f"GitHub Pages enabled for {repo_name}")
+                else:
+                    logger.warning(
+                        f"Failed to enable GitHub Pages: {response.status_code} {response.text}"
+                    )
 
             # Get the latest commit SHA
             commits = repo.get_commits()
             latest_commit_sha = commits[0].sha
 
-            logger.info(f"Repository created successfully: {repo.html_url}")
+            # Prepare Pages URL
+            pages_url = f"https://{user.login}.github.io/{repo_name}/"
+
+            # Save to CSV database
+            self.task_db.save_task_repo(
+                task=task_name,
+                email=email,
+                repo_name=repo_name,
+                repo_url=repo.html_url,
+                commit_sha=latest_commit_sha,
+                pages_url=pages_url,
+                round_num=round_num,
+            )
+
+            logger.info(
+                f"Repository {'updated' if task_info else 'created'} successfully: {repo.html_url}"
+            )
 
             return {
                 "repo_name": repo_name,
                 "repo_url": repo.html_url,
                 "commit_sha": latest_commit_sha,
+                "pages_url": pages_url,
             }
 
         except Exception as e:
@@ -418,7 +489,105 @@ SOFTWARE."""
             logger.error(f"Error setting up GitHub Pages: {str(e)}")
             # Don't raise here as this might not be critical
 
-    async def post_evaluation_results(self, request: BuildRequest, repo_info: dict):
+    async def wait_and_post_results(self, request: BuildRequest, repo_info: dict):
+        """Wait for workflow completion and Pages deployment, then post results."""
+        try:
+            # Get the repository object
+            user = self.github_client.get_user()
+            repo = self.github_client.get_repo(f"{user.login}/{repo_info['repo_name']}")
+
+            # Wait for workflow to complete
+            logger.info("Waiting for GitHub Actions workflow to complete...")
+            workflow_completed = await self.wait_for_workflow_completion(repo)
+
+            if workflow_completed:
+                logger.info("Workflow completed successfully")
+            else:
+                logger.warning("Workflow did not complete in time")
+
+            # Wait for Pages to be accessible
+            pages_url = await self.wait_for_pages_deployment(
+                repo, repo_info["pages_url"]
+            )
+
+            # Post evaluation results
+            await self.post_evaluation_results(request, repo_info, pages_url)
+
+        except Exception as e:
+            logger.error(f"Error in wait and post results: {str(e)}")
+
+    async def wait_for_workflow_completion(self, repo, timeout: int = 300) -> bool:
+        """Wait for GitHub Actions workflow to complete."""
+        try:
+            import time as time_module
+
+            start_time = time_module.time()
+
+            logger.info(f"Checking workflow runs for repository: {repo.name}")
+            await asyncio.sleep(5)  # Wait for workflow to start
+
+            while time_module.time() - start_time < timeout:
+                try:
+                    workflows = repo.get_workflow_runs()
+
+                    if workflows.totalCount > 0:
+                        latest_run = workflows[0]
+
+                        logger.info(
+                            f"Workflow status: {latest_run.status}, "
+                            f"conclusion: {latest_run.conclusion}"
+                        )
+
+                        if latest_run.status == "completed":
+                            if latest_run.conclusion == "success":
+                                logger.info("Workflow completed successfully!")
+                                return True
+                            else:
+                                logger.warning(
+                                    f"Workflow completed with conclusion: {latest_run.conclusion}"
+                                )
+                                return False
+
+                        logger.info(f"Workflow still {latest_run.status}, waiting...")
+                    else:
+                        logger.info("No workflow runs found yet, waiting...")
+
+                except Exception as e:
+                    logger.debug(f"Error checking workflow status: {str(e)}")
+
+                await asyncio.sleep(10)
+
+            logger.warning(f"Workflow did not complete within {timeout} seconds")
+            return False
+
+        except Exception as e:
+            logger.error(f"Error waiting for workflow completion: {str(e)}")
+            return False
+
+    async def wait_for_pages_deployment(self, repo, pages_url: str) -> str:
+        """Wait for GitHub Pages to be accessible."""
+        logger.info("Waiting for GitHub Pages to be accessible...")
+        max_attempts = 30  # 5 minutes with 10-second intervals
+
+        for attempt in range(max_attempts):
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(pages_url, timeout=10.0)
+                    if response.status_code == 200:
+                        logger.info(f"GitHub Pages is ready: {pages_url}")
+                        return pages_url
+            except Exception as e:
+                logger.debug(f"Pages not ready yet (attempt {attempt + 1}): {str(e)}")
+
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(10)
+
+        logger.warning(f"GitHub Pages may not be ready yet: {pages_url}")
+        return pages_url
+
+    async def post_evaluation_results(
+        self, request: BuildRequest, repo_info: dict, pages_url: str
+    ):
         """Post results to the evaluation URL with retry logic."""
         evaluation_payload = EvaluationPayload(
             email=request.email,
@@ -427,11 +596,13 @@ SOFTWARE."""
             nonce=request.nonce,
             repo_url=repo_info["repo_url"],
             commit_sha=repo_info["commit_sha"],
-            pages_url=f"https://{self.github_client.get_user().login}.github.io/{repo_info['repo_name']}"
-            if self.github_client
-            else "https://user.github.io/repo",
+            pages_url=pages_url,
         )
-        print(evaluation_payload.model_dump_json())
+
+        logger.info(
+            f"Posting evaluation results: {evaluation_payload.model_dump_json()}"
+        )
+
         # Retry logic with exponential backoff
         max_retries = 5
         delay = 1
