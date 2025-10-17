@@ -6,6 +6,7 @@ from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
+from logger import telegram_logger
 
 load_dotenv(override=True)
 
@@ -522,7 +523,22 @@ class WebsiteAgent:
             f"Starting website generation for round {context.get('round', 1)}"
         )
 
-        SYSTEM_PROMPT = """
+        task_name = context.get("task", "Unknown")
+        round_num = context.get("round", 1)
+
+        telegram_logger.log_info(
+            f"🤖 Starting AI website generation for {task_name}",
+            {
+                "task": task_name,
+                "round": round_num,
+                "brief_length": len(context.get("brief", "")),
+                "num_checks": len(context.get("checks", [])),
+                "num_attachments": len(context.get("attachments", [])),
+            },
+        )
+
+        try:
+            SYSTEM_PROMPT = """
 You will be provided with the repository context and a directory tree. This context is the authoritative current
 state of the repository. The human message will include two tagged sections:
 
@@ -566,22 +582,57 @@ Final README expectations:
 Follow these instructions exactly. Use the tools to inspect the current repo state when in doubt.
 """
 
-        inputs = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=self._prepare_context_for_llm(context)),
-        ]
+            inputs = [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=self._prepare_context_for_llm(context)),
+            ]
 
-        for chunk in self.agent.stream({"messages": inputs}, stream_mode="values"):
-            chunk["messages"][-1].pretty_print()
+            # Track agent execution
+            telegram_logger.log_info(
+                f"🧠 Executing AI agent for {task_name}",
+                {"task": task_name, "round": round_num},
+            )
 
-        # Placeholder return - replace with actual implementation
-        return {
-            "success": True,
-            "message": "Website generation placeholder - implement LLM integration here",
-            "files_modified": [],
-            "files_created": [],
-            "files_deleted": [],
-        }
+            for chunk in self.agent.stream({"messages": inputs}, stream_mode="values"):
+                chunk["messages"][-1].pretty_print()
+
+            # Placeholder return - replace with actual implementation
+            result = {
+                "success": True,
+                "message": "Website generation placeholder - implement LLM integration here",
+                "files_modified": [],
+                "files_created": [],
+                "files_deleted": [],
+            }
+
+            telegram_logger.log_info(
+                f"✅ AI agent completed for {task_name}",
+                {
+                    "task": task_name,
+                    "round": round_num,
+                    "success": result["success"],
+                    "message": result.get("message", ""),
+                },
+            )
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Error in AI website generation: {str(e)}")
+            telegram_logger.log_error(
+                f"AI website generation failed for {task_name}",
+                context={
+                    "task": task_name,
+                    "round": round_num,
+                    "operation": "generate_website",
+                },
+                exception=e,
+            )
+            return {
+                "success": False,
+                "error": str(e),
+                "message": f"AI generation failed: {str(e)}",
+            }
 
     def _prepare_context_for_llm(self, context: Dict[str, Any]) -> str:
         """

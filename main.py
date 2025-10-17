@@ -3,7 +3,6 @@ import asyncio
 import httpx
 import logging
 import base64
-import hashlib
 import time
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from github import Github
@@ -11,6 +10,7 @@ from models import BuildRequest, BuildResponse, EvaluationPayload
 from dotenv import load_dotenv
 from agent import WebsiteAgent, AgentTools
 from db import TaskRepository
+from logger import telegram_logger
 
 # Load environment variables from .env file
 load_dotenv(override=True)
@@ -47,6 +47,23 @@ class AppBuilder:
         Process the build request in the background.
         This is the main orchestration method.
         """
+        # Generate unique session ID for tracking
+        session_id = f"build_{request.task}_{request.round}_{int(time.time())}"
+
+        # Start session tracking
+        telegram_logger.start_session(
+            session_id,
+            request.task,
+            {
+                "round": request.round,
+                "email": request.email,
+                "task": request.task,
+                "has_attachments": len(request.attachments) > 0,
+                "num_attachments": len(request.attachments),
+                "evaluation_url": request.evaluation_url,
+            },
+        )
+
         try:
             logger.info(
                 f"Starting build process for {request.task}, round {request.round}"
@@ -105,8 +122,42 @@ class AppBuilder:
                 f"Successfully completed build for {request.task}, round {request.round}"
             )
 
+            # Log successful completion
+            telegram_logger.end_session(
+                session_id,
+                request.task,
+                True,
+                {
+                    "repo_info": repo_info,
+                    "attachments_processed": len(attachments_data),
+                    "evaluation_sent": bool(
+                        self.github_client and request.evaluation_url
+                    ),
+                },
+            )
+
         except Exception as e:
             logger.error(f"Error in build process: {str(e)}")
+
+            # Log error with context
+            telegram_logger.log_error(
+                f"Build process failed for {request.task}",
+                context={
+                    "task": request.task,
+                    "round": request.round,
+                    "email": request.email,
+                    "error_type": type(e).__name__,
+                },
+                exception=e,
+            )
+
+            telegram_logger.end_session(
+                session_id,
+                request.task,
+                False,
+                {"error": str(e), "error_type": type(e).__name__},
+            )
+
             # In a production system, you might want to retry or send error notifications
 
     async def process_attachments(self, attachments):
@@ -186,9 +237,24 @@ class AppBuilder:
                 logger.warning(
                     "GitHub client not available, skipping agent enhancement"
                 )
+                telegram_logger.log_warning(
+                    f"⚠️ GitHub client not available for {repo_name}",
+                    {"repo_name": repo_name, "round": round_num},
+                )
                 return {"success": False, "error": "GitHub client not available"}
 
             logger.info(f"Enhancing repository {repo_name} with AI agent...")
+
+            telegram_logger.log_info(
+                f"🤖 Starting AI agent enhancement for {repo_name}",
+                {
+                    "repo_name": repo_name,
+                    "round": round_num,
+                    "brief_length": len(brief),
+                    "num_checks": len(checks),
+                    "num_attachments": len(attachments_data),
+                },
+            )
 
             # Get the repository object
             user = self.github_client.get_user()
@@ -213,15 +279,43 @@ class AppBuilder:
 
             if result.get("success"):
                 logger.info("AI agent successfully enhanced the repository")
+                telegram_logger.log_info(
+                    f"✅ AI agent successfully enhanced {repo_name}",
+                    {
+                        "repo_name": repo_name,
+                        "round": round_num,
+                        "files_modified": result.get("files_modified", []),
+                        "files_created": result.get("files_created", []),
+                        "files_deleted": result.get("files_deleted", []),
+                    },
+                )
             else:
                 logger.warning(
                     f"AI agent completed with issues: {result.get('message', 'Unknown error')}"
+                )
+                telegram_logger.log_warning(
+                    f"⚠️ AI agent completed with issues for {repo_name}",
+                    {
+                        "repo_name": repo_name,
+                        "round": round_num,
+                        "error": result.get("error"),
+                        "message": result.get("message"),
+                    },
                 )
 
             return result
 
         except Exception as e:
             logger.error(f"Error enhancing repository with agent: {str(e)}")
+            telegram_logger.log_error(
+                f"AI agent enhancement failed for {repo_name}",
+                context={
+                    "repo_name": repo_name,
+                    "round": round_num,
+                    "operation": "enhance_with_agent",
+                },
+                exception=e,
+            )
             return {"success": False, "error": str(e)}
 
     def generate_html_template(self, brief: str) -> str:
@@ -864,6 +958,16 @@ jobs:
             f"Posting evaluation results: {evaluation_payload.model_dump_json()}"
         )
 
+        telegram_logger.log_info(
+            f"📤 Posting evaluation results for {request.task}",
+            {
+                "task": request.task,
+                "round": request.round,
+                "pages_url": pages_url,
+                "evaluation_url": str(request.evaluation_url),
+            },
+        )
+
         # Retry logic with exponential backoff
         max_retries = 5
         delay = 1
@@ -882,6 +986,14 @@ jobs:
                         logger.info(
                             f"Successfully posted evaluation results (attempt {attempt + 1})"
                         )
+                        telegram_logger.log_info(
+                            f"✅ Successfully posted evaluation results for {request.task}",
+                            {
+                                "task": request.task,
+                                "attempt": attempt + 1,
+                                "status_code": response.status_code,
+                            },
+                        )
                         return
                     else:
                         logger.warning(
@@ -893,11 +1005,28 @@ jobs:
                     f"Error posting to evaluation URL (attempt {attempt + 1}): {str(e)}"
                 )
 
+                if attempt < max_retries - 1:
+                    telegram_logger.log_retry(
+                        attempt + 1,
+                        max_retries,
+                        f"posting evaluation results for {request.task}",
+                        str(e),
+                    )
+
             if attempt < max_retries - 1:
                 await asyncio.sleep(delay)
                 delay *= 2  # Exponential backoff
 
         logger.error("Failed to post evaluation results after all retries")
+        telegram_logger.log_error(
+            f"Failed to post evaluation results for {request.task} after {max_retries} attempts",
+            {
+                "task": request.task,
+                "round": request.round,
+                "max_retries": max_retries,
+                "evaluation_url": str(request.evaluation_url),
+            },
+        )
 
 
 # Initialize the app builder
@@ -931,8 +1060,26 @@ async def build_application(request: BuildRequest, background_tasks: BackgroundT
             f"Received build request for task: {request.task}, round: {request.round}"
         )
 
+        # Log API request
+        telegram_logger.log_info(
+            f"🚀 New build request received: {request.task}",
+            {
+                "task": request.task,
+                "round": request.round,
+                "email": request.email,
+                "has_attachments": len(request.attachments) > 0,
+                "num_attachments": len(request.attachments),
+                "brief_length": len(request.brief),
+                "num_checks": len(request.checks),
+            },
+        )
+
         # Validate secret
         if not app_builder.validate_secret(request.secret):
+            telegram_logger.log_warning(
+                f"🔐 Invalid secret provided for task: {request.task}",
+                {"task": request.task, "round": request.round, "email": request.email},
+            )
             raise HTTPException(status_code=401, detail="Invalid secret")
 
         # Add the build process to background tasks
@@ -945,13 +1092,27 @@ async def build_application(request: BuildRequest, background_tasks: BackgroundT
             round=request.round,
         )
 
+    except HTTPException as he:
+        # Re-raise HTTP exceptions as-is
+        raise he
     except Exception as e:
         logger.error(f"Error processing build request: {str(e)}")
+        telegram_logger.log_error(
+            f"API endpoint error for task: {request.task}",
+            context={
+                "task": request.task,
+                "round": request.round,
+                "endpoint": "/build",
+            },
+            exception=e,
+        )
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 if __name__ == "__main__":
     import uvicorn
+    import signal
+    import sys
 
     # Load environment variables for configuration
     host = os.getenv("HOST", "0.0.0.0")
@@ -969,6 +1130,32 @@ if __name__ == "__main__":
             "Warning: API_SECRET not set. Using default secret (not secure for production)."
         )
 
+    # Graceful shutdown handler
+    def signal_handler(sig, frame):
+        print("\nShutting down gracefully...")
+        telegram_logger.log_info("🛑 Website Developer API shutting down")
+        telegram_logger.shutdown()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     print(f"Starting Website Developer API on {host}:{port}")
 
-    uvicorn.run("main:app", host=host, port=port)
+    # Log startup
+    telegram_logger.log_info(
+        "🚀 Website Developer API starting up",
+        {
+            "host": host,
+            "port": port,
+            "github_token_configured": bool(github_token),
+            "api_secret_configured": bool(api_secret),
+        },
+    )
+
+    try:
+        uvicorn.run("main:app", host=host, port=port)
+    except KeyboardInterrupt:
+        signal_handler(signal.SIGINT, None)
+    finally:
+        telegram_logger.shutdown()
