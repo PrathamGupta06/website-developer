@@ -55,10 +55,23 @@ class AppBuilder:
             # Step 1: Parse attachments and save them
             attachments_data = await self.process_attachments(request.attachments)
 
-            # Step 2: Generate initial application code based on brief
-            app_code = await self.generate_application_code(
-                request.brief, request.checks, attachments_data
-            )
+            # Step 2: Generate initial application code based on brief (only for round 1)
+            app_code = {}
+            if request.round == 1:
+                app_code = await self.generate_application_code(
+                    request.brief, request.checks, attachments_data
+                )
+                logger.info("Generated skeleton application code for round 1")
+            else:
+                # For round 2+, only add attachment files if any
+                for attachment in attachments_data:
+                    if isinstance(attachment["data"], bytes):
+                        app_code[attachment["name"]] = attachment["data"]
+                    else:
+                        app_code[attachment["name"]] = attachment["data"]
+                logger.info(
+                    f"Round {request.round}: Skipping skeleton generation, only processing attachments"
+                )
 
             # Step 3: Create or update GitHub repository (handles both round 1 and 2+)
             repo_info = await self.create_github_repository(
@@ -390,12 +403,12 @@ SOFTWARE."""
                 # Handle different content types properly
                 if file_info["encoding"] == "base64":
                     # For binary content, encode as base64
-                    content_b64 = base64.b64encode(file_info["content"]).decode('utf-8')
+                    content_b64 = base64.b64encode(file_info["content"]).decode("utf-8")
                     blob = repo.create_git_blob(content_b64, "base64")
                 else:
                     # For text content, use UTF-8
                     blob = repo.create_git_blob(file_info["content"], "utf-8")
-                
+
                 element = {
                     "path": file_info["path"],
                     "mode": "100644",  # File mode
@@ -403,7 +416,9 @@ SOFTWARE."""
                     "sha": blob.sha,
                 }
                 element_list.append(element)
-                logger.info(f"Prepared file: {file_info['path']} ({file_info['encoding']})")
+                logger.info(
+                    f"Prepared file: {file_info['path']} ({file_info['encoding']})"
+                )
 
             # Create tree
             if base_tree:
@@ -441,7 +456,7 @@ SOFTWARE."""
         """Upload files one by one to ensure they work."""
         try:
             logger.info("Uploading files individually...")
-            
+
             # Upload app files
             for filename, content in app_files.items():
                 try:
@@ -450,12 +465,14 @@ SOFTWARE."""
                     file_sha = None
                     try:
                         file_obj = repo.get_contents(filename)
-                        if file_obj and hasattr(file_obj, 'sha'):
+                        if file_obj and hasattr(file_obj, "sha"):
                             file_exists = True
                             file_sha = file_obj.sha
                             logger.info(f"File {filename} already exists, will update")
                         else:
-                            logger.info(f"File {filename} exists but no SHA found, will create")
+                            logger.info(
+                                f"File {filename} exists but no SHA found, will create"
+                            )
                     except Exception:
                         file_exists = False
                         logger.info(f"File {filename} doesn't exist, will create")
@@ -466,10 +483,10 @@ SOFTWARE."""
                         # Handle binary files (like CSV) - convert to text first
                         try:
                             # Try to decode as UTF-8 first
-                            final_content = content.decode('utf-8')
+                            final_content = content.decode("utf-8")
                         except UnicodeDecodeError:
                             # If UTF-8 fails, use base64 encoding
-                            final_content = base64.b64encode(content).decode('utf-8')
+                            final_content = base64.b64encode(content).decode("utf-8")
                     else:
                         # Handle text files
                         final_content = content
@@ -477,18 +494,11 @@ SOFTWARE."""
                     # Create or update file
                     if file_exists and file_sha:
                         repo.update_file(
-                            filename,
-                            f"Update {filename}",
-                            final_content,
-                            file_sha
+                            filename, f"Update {filename}", final_content, file_sha
                         )
                         logger.info(f"Updated file: {filename}")
                     else:
-                        repo.create_file(
-                            filename,
-                            f"Add {filename}",
-                            final_content
-                        )
+                        repo.create_file(filename, f"Add {filename}", final_content)
                         logger.info(f"Created file: {filename}")
 
                 except Exception as file_error:
@@ -501,9 +511,7 @@ SOFTWARE."""
                 workflow_path = ".github/workflows/pages.yml"
                 try:
                     repo.create_file(
-                        workflow_path,
-                        "Add GitHub Pages workflow",
-                        workflow_content
+                        workflow_path, "Add GitHub Pages workflow", workflow_content
                     )
                     logger.info(f"Added workflow file: {workflow_path}")
                 except Exception as workflow_error:
@@ -514,7 +522,7 @@ SOFTWARE."""
                             workflow_path,
                             "Update GitHub Pages workflow",
                             workflow_content,
-                            file_obj.sha
+                            file_obj.sha,
                         )
                         logger.info(f"Updated workflow file: {workflow_path}")
                     else:
@@ -574,7 +582,7 @@ jobs:
         if not self.github_client:
             logger.warning("GitHub token not configured, skipping repo creation")
             return {
-                "repo_name": f"generated-{task_name}",
+                "repo_name": f"{task_name}",
                 "repo_url": "https://github.com/user/repo",
                 "commit_sha": "abc123",
             }
@@ -583,7 +591,7 @@ jobs:
             # Check if repository already exists for this task
             task_info = self.task_db.get_repo_by_task(task_name)
             user = self.github_client.get_user()
-            repo_name = f"generated-{task_name}"
+            repo_name = f"{task_name}"
 
             if task_info:
                 # Repository exists, update it instead of creating new one
@@ -607,7 +615,7 @@ jobs:
                 repo = None
                 attempts = 0
                 max_attempts = 5
-                
+
                 while repo is None and attempts < max_attempts:
                     try:
                         repo = user.create_repo(
@@ -620,22 +628,35 @@ jobs:
                     except Exception as create_error:
                         if "already exists" in str(create_error):
                             # Generate unique name with timestamp
-                            timestamp = str(int(time.time()))[-6:]  # Last 6 digits of timestamp
-                            repo_name = f"generated-{task_name}-{timestamp}"
-                            logger.info(f"Repository exists, trying with unique name: {repo_name}")
+                            timestamp = str(int(time.time()))[
+                                -6:
+                            ]  # Last 6 digits of timestamp
+                            repo_name = f"{task_name}-{timestamp}"
+                            logger.info(
+                                f"Repository exists, trying with unique name: {repo_name}"
+                            )
                             attempts += 1
                         else:
-                            logger.error(f"Error creating repository: {str(create_error)}")
+                            logger.error(
+                                f"Error creating repository: {str(create_error)}"
+                            )
                             raise
 
                 if repo is None:
-                    raise Exception(f"Failed to create repository after {max_attempts} attempts")
+                    raise Exception(
+                        f"Failed to create repository after {max_attempts} attempts"
+                    )
 
-            # Upload files one by one (temporary fix)
-            await self.upload_files_individually(repo, app_files, round_num == 1)
+            # Upload files only if there are files to upload (skip for round 2 without new files)
+            if app_files:
+                await self.upload_files_individually(repo, app_files, round_num == 1)
+                logger.info(f"Uploaded {len(app_files)} files for round {round_num}")
+            else:
+                logger.info(f"Round {round_num}: No files to upload, repository exists")
 
-            # Enable GitHub Pages for the repository
-            await self.enable_github_pages_api(repo)
+            # Enable GitHub Pages for the repository (only for round 1)
+            if round_num == 1:
+                await self.enable_github_pages_api(repo)
 
             # Get the latest commit SHA
             commits = repo.get_commits()
@@ -694,38 +715,37 @@ jobs:
         """Enable GitHub Pages using GitHub API."""
         try:
             logger.info(f"Enabling GitHub Pages for repository: {repo.name}")
-            
+
             # Use GitHub API to enable Pages
             # We need to use the raw API since PyGithub doesn't have direct Pages support
-            
+
             headers = {
                 "Authorization": f"token {self.github_token}",
                 "Accept": "application/vnd.github.v3+json",
-                "X-GitHub-Api-Version": "2022-11-28"
+                "X-GitHub-Api-Version": "2022-11-28",
             }
-            
+
             # Enable Pages with GitHub Actions as source
             pages_config = {
-                "source": {
-                    "branch": "main",
-                    "path": "/"
-                },
-                "build_type": "workflow"  # Use GitHub Actions workflow
+                "source": {"branch": "main", "path": "/"},
+                "build_type": "workflow",  # Use GitHub Actions workflow
             }
-            
+
             url = f"https://api.github.com/repos/{repo.full_name}/pages"
-            
+
             async with httpx.AsyncClient() as client:
                 response = await client.post(url, json=pages_config, headers=headers)
-                
+
                 if response.status_code == 201:
                     logger.info("GitHub Pages enabled successfully")
                 elif response.status_code == 409:
                     logger.info("GitHub Pages already enabled")
                 else:
-                    logger.warning(f"Pages enablement returned status: {response.status_code}")
+                    logger.warning(
+                        f"Pages enablement returned status: {response.status_code}"
+                    )
                     logger.debug(f"Response: {response.text}")
-                    
+
         except Exception as e:
             logger.warning(f"Could not enable GitHub Pages via API: {str(e)}")
             # Don't raise here as this might not be critical

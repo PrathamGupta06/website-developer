@@ -242,6 +242,239 @@ class AgentTools:
             self.logger.error(f"Error building repository tree: {str(e)}")
             return {"error": str(e), "files": [], "directories": {}}
 
+    def get_repository_context(self, max_chars: int = 2000) -> str:
+        """
+        Get current repository files content up to max_chars limit.
+
+        Args:
+            max_chars: Maximum characters to include in context
+
+        Returns:
+            Formatted string with file contents
+        """
+        try:
+            context_parts = []
+            char_count = 0
+
+            # Always include README.md first if it exists
+            try:
+                readme_content = self.repo.get_contents("README.md")
+                if hasattr(readme_content, "decoded_content"):
+                    content = readme_content.decoded_content.decode("utf-8")
+                    file_section = f"## README.md\n```\n{content}\n```\n\n"
+                    if char_count + len(file_section) <= max_chars:
+                        context_parts.append(file_section)
+                        char_count += len(file_section)
+            except Exception:
+                pass  # README.md doesn't exist
+
+            # Get all files in root directory
+            try:
+                contents = self.repo.get_contents("")
+                if not isinstance(contents, list):
+                    contents = [contents]
+
+                # Sort files by priority (common web files first)
+                priority_files = ["index.html", "script.js", "style.css"]
+                other_files = [
+                    item
+                    for item in contents
+                    if item.type == "file"
+                    and item.name not in priority_files
+                    and item.name != "README.md"
+                ]
+
+                # Process priority files first, then others
+                for filename in priority_files:
+                    for item in contents:
+                        if item.type == "file" and item.name == filename:
+                            try:
+                                if char_count >= max_chars:
+                                    break
+
+                                # Skip binary files entirely
+                                if self._is_binary_file(item.name):
+                                    self.logger.debug(
+                                        f"Skipping binary file: {item.name}"
+                                    )
+                                    break
+
+                                content = item.decoded_content.decode("utf-8")
+
+                                # Truncate large files to 500 characters
+                                if len(content) > 500:
+                                    content = content[:500] + "...[truncated]"
+
+                                file_section = (
+                                    f"## {item.name}\n```\n{content}\n```\n\n"
+                                )
+                                if char_count + len(file_section) <= max_chars:
+                                    context_parts.append(file_section)
+                                    char_count += len(file_section)
+                                else:
+                                    # Truncate content to fit remaining space
+                                    remaining_chars = (
+                                        max_chars
+                                        - char_count
+                                        - len(f"## {item.name}\n```\n...\n```\n\n")
+                                    )
+                                    if remaining_chars > 50:
+                                        truncated_content = (
+                                            content[:remaining_chars] + "..."
+                                        )
+                                        context_parts.append(
+                                            f"## {item.name}\n```\n{truncated_content}\n```\n\n"
+                                        )
+                                        char_count = max_chars
+                                    break
+                            except Exception as e:
+                                self.logger.debug(
+                                    f"Could not read {item.name}: {str(e)}"
+                                )
+
+                # Process other files if space remains
+                for item in other_files:
+                    if char_count >= max_chars:
+                        break
+                    try:
+                        # Skip binary files entirely
+                        if self._is_binary_file(item.name):
+                            self.logger.debug(f"Skipping binary file: {item.name}")
+                            continue
+
+                        # Skip extremely large files (probably generated/minified)
+                        if item.size > 100000:  # Skip files larger than 100KB
+                            self.logger.debug(
+                                f"Skipping large file: {item.name} ({item.size} bytes)"
+                            )
+                            continue
+
+                        content = item.decoded_content.decode("utf-8")
+
+                        # Truncate large files to 500 characters
+                        if len(content) > 500:
+                            content = content[:500] + "...[truncated]"
+
+                        file_section = f"## {item.name}\n```\n{content}\n```\n\n"
+                        if char_count + len(file_section) <= max_chars:
+                            context_parts.append(file_section)
+                            char_count += len(file_section)
+                        else:
+                            break
+                    except Exception as e:
+                        self.logger.debug(f"Could not read {item.name}: {str(e)}")
+
+            except Exception as e:
+                self.logger.error(f"Error getting repository contents: {str(e)}")
+
+            return "".join(context_parts)
+
+        except Exception as e:
+            self.logger.error(f"Error getting repository context: {str(e)}")
+            return "Error reading repository context"
+
+    def _is_binary_file(self, filename: str) -> bool:
+        """
+        Check if a file is likely to be binary based on its extension.
+
+        Args:
+            filename: Name of the file to check
+
+        Returns:
+            True if file is likely binary, False otherwise
+        """
+        binary_extensions = {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".gif",
+            ".bmp",
+            ".ico",
+            ".tiff",
+            ".webp",  # Images
+            ".pdf",
+            ".doc",
+            ".docx",
+            ".xls",
+            ".xlsx",
+            ".ppt",
+            ".pptx",  # Documents
+            ".zip",
+            ".tar",
+            ".gz",
+            ".bz2",
+            ".7z",
+            ".rar",  # Archives
+            ".exe",
+            ".dll",
+            ".so",
+            ".dylib",  # Executables
+            ".mp3",
+            ".mp4",
+            ".avi",
+            ".mov",
+            ".wav",
+            ".flac",  # Media
+            ".bin",
+            ".dat",
+            ".db",
+            ".sqlite",
+            ".sqlite3",  # Data files
+            ".woff",
+            ".woff2",
+            ".ttf",
+            ".otf",
+            ".eot",  # Fonts
+        }
+
+        # Get file extension
+        extension = "." + filename.lower().split(".")[-1] if "." in filename else ""
+        return extension in binary_extensions
+
+    def get_formatted_directory_tree(self, path: str = "", prefix: str = "") -> str:
+        """
+        Get repository directory structure as a formatted tree.
+
+        Args:
+            path: Directory path to start from
+            prefix: Prefix for tree formatting
+
+        Returns:
+            Formatted tree string
+        """
+        try:
+            tree_lines = []
+            contents = self.repo.get_contents(path)
+
+            if not isinstance(contents, list):
+                contents = [contents]
+
+            # Sort contents: directories first, then files
+            directories = [item for item in contents if item.type == "dir"]
+            files = [item for item in contents if item.type == "file"]
+
+            all_items = directories + files
+
+            for i, item in enumerate(all_items):
+                is_last = i == len(all_items) - 1
+                connector = "└── " if is_last else "├── "
+                tree_lines.append(f"{prefix}{connector}{item.name}")
+
+                if item.type == "dir":
+                    # Recursively get subdirectory contents
+                    extension = "    " if is_last else "│   "
+                    subtree = self.get_formatted_directory_tree(
+                        item.path, prefix + extension
+                    )
+                    if subtree:
+                        tree_lines.append(subtree)
+
+            return "\n".join(tree_lines)
+
+        except Exception as e:
+            self.logger.error(f"Error getting directory tree: {str(e)}")
+            return f"Error reading directory structure: {str(e)}"
+
 
 class WebsiteAgent:
     """
@@ -259,6 +492,8 @@ class WebsiteAgent:
             tool(self.tools.list_directory_contents),
             tool(self.tools.delete_file),
             tool(self.tools.get_repository_tree),
+            tool(self.tools.get_repository_context),
+            tool(self.tools.get_formatted_directory_tree),
         ]
 
         self.agent = create_react_agent(
@@ -288,30 +523,54 @@ class WebsiteAgent:
         )
 
         SYSTEM_PROMPT = """
-        You have to make the changes, be specific about the tasks that is given to you and make sure that your generated code passes the test cases.
-        
-        IMPORTANT: A GitHub Pages workflow file already exists at `.github/workflows/pages.yml` - DO NOT create or modify it.
-        The workflow is already configured to deploy your changes automatically when you commit to the main branch.
-        
-        Your job is to:
-        1. Analyze the brief and requirements
-        2. Use the tools to read current repository state
-        3. Generate/update appropriate HTML, CSS, JS files
-        4. Use tools to update the repository
-        5. DO NOT touch the workflow file - it's already set up correctly
+You will be provided with the repository context and a directory tree. This context is the authoritative current
+state of the repository. The human message will include two tagged sections:
 
-        The existing workflow configuration:
-        - Triggers on push to main branch
-        - Deploys all files in the repository to GitHub Pages
-        - Handles both static files and any build artifacts
-        - Already has proper permissions configured
+1) <current_repository_context>...</current_repository_context>  - contains up to ~2000 characters of key
+files (README.md and other important files) in code blocks. Use that to understand existing code.
 
-        Focus on creating high-quality, functional web applications that meet the requirements.
-        """
+2) <current_directory_structure>...</current_directory_structure> - a formatted tree of the repo layout.
+
+Your responsibilities (follow exactly, word-for-word):
+- Read the brief and all checks carefully and prioritize them above all else.
+- Inspect attachment files (CSV or other data files). For CSVs, validate the header and a few example rows
+to ensure you understand the data shape before using it.
+- Use the provided repository context and directory tree as your working state. Do not assume files not
+included in the context exist; use tools to read additional files if needed.
+- Only modify repository files necessary to satisfy the brief and checks. Do NOT modify the existing
+GitHub Actions workflow at `.github/workflows/pages.yml`.
+- Produce clean, well-structured, idiomatic code. Make minimal, focused changes with clear intent.
+- After making code changes, update or create a high-quality `README.md` that includes: summary, setup,
+usage, code explanation, and license. The README must be detailed and helpful for reviewers and graders.
+- When updating files, ensure you include comments where non-obvious logic is added.
+
+Output and tool usage rules:
+- Use the provided tools to read or update files. If you need to examine more files than provided in the
+<current_repository_context>, call the read_files tool for the exact file path.
+- When you finish all changes, create or update `README.md` to document what you changed and why, and how
+to run and test the project locally.
+- If you encounter CSV or other data attachments, report briefly (1-3 lines) your interpretation of the
+schema and any assumptions you make before using them.
+
+Quality gates:
+- Code must aim to pass the checks exactly. Pay attention to edge cases, null values, and input formats.
+- Keep changes minimal and well-tested. If you add JS/HTML/CSS, make them robust against missing data.
+
+Final README expectations:
+- Concise summary of the app and what changed
+- Clear setup steps (how to open locally or what the Pages URL will show)
+- Usage examples including how to use attachments or URL query params if applicable
+- Code explanation (files changed and why)
+- License section (MIT)
+
+Follow these instructions exactly. Use the tools to inspect the current repo state when in doubt.
+"""
+
         inputs = [
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=self._prepare_context_for_llm(context)),
         ]
+
         for chunk in self.agent.stream({"messages": inputs}, stream_mode="values"):
             chunk["messages"][-1].pretty_print()
 
@@ -334,8 +593,6 @@ class WebsiteAgent:
         Returns:
             Formatted context string for LLM
         """
-        # TODO: Format context appropriately for your chosen LLM
-
         formatted_context = f"""
 Task: {context.get("task", "Unknown")}
 Round: {context.get("round", 1)}
@@ -354,9 +611,21 @@ Requirements to fulfill:
             for att in context["attachments"]:
                 formatted_context += f"- {att['name']}\n"
 
-        if context.get("current_repo_state"):
-            formatted_context += "\nCurrent repository structure:\n"
-            formatted_context += str(context["current_repo_state"])
+        # Add current repository context
+        try:
+            repo_context = self.tools.get_repository_context(10000)
+            if repo_context.strip():
+                formatted_context += f"\n<current_repository_context>\n{repo_context}</current_repository_context>\n"
+        except Exception as e:
+            self.logger.warning(f"Could not get repository context: {str(e)}")
+
+        # Add directory structure
+        try:
+            directory_tree = self.tools.get_formatted_directory_tree()
+            if directory_tree.strip():
+                formatted_context += f"\n<current_directory_structure>\n{directory_tree}\n</current_directory_structure>\n"
+        except Exception as e:
+            self.logger.warning(f"Could not get directory structure: {str(e)}")
 
         return formatted_context
 
