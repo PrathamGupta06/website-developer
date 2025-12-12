@@ -804,18 +804,31 @@ Follow these instructions exactly. Use the tools to inspect the current repo sta
                 f"🧠 Executing AI agent for {task_name}",
                 {"task": task_name, "round": round_num},
             )
-
+            
             for chunk in self.agent.stream({"messages": inputs}, stream_mode="values"):
                 logger.info(chunk["messages"][-1].pretty_repr())
+            
+            # After agent completes, fetch the latest commit SHA directly from repository
+            commit_sha = None
+            try:
+                logger.info("Fetching latest commit SHA from repository...")
+                ref = self.tools.repo.get_git_ref("heads/main")
+                commit_sha = ref.object.sha
+                logger.info(f"Latest commit SHA from repository: {commit_sha}")
+            except Exception as e:
+                logger.warning(f"Could not fetch latest commit SHA: {e}")
 
-            # Placeholder return - replace with actual implementation
+            # Build result
             result = {
                 "success": True,
-                "message": "Website generation placeholder - implement LLM integration here",
-                "files_modified": [],
-                "files_created": [],
-                "files_deleted": [],
+                "message": "Website generation completed successfully",
             }
+            
+            # Add commit SHA if available
+            if commit_sha:
+                result["commit_sha"] = commit_sha
+            else:
+                logger.warning("No commit SHA available - repository may not have any commits")
 
             telegram_logger.log_info(
                 f"✅ AI agent completed for {task_name}",
@@ -824,6 +837,7 @@ Follow these instructions exactly. Use the tools to inspect the current repo sta
                     "round": round_num,
                     "success": result["success"],
                     "message": result.get("message", ""),
+                    "commit_sha": commit_sha,
                 },
             )
 
